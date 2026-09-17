@@ -1,12 +1,17 @@
 [Unit]
-Description=Redmibook 15 2022 Fingerprint Driver
-After=NetworkManager.service
+Description=FPC 10a5:9201 fingerprint driver
+After=dbus.service
+Requires=dbus.service
+Conflicts=fprintd.service
 
 [Service]
-Type=dbus
-BusName=net.reactivated.Fprint
-ExecStart=/usr/bin/podman run --privileged -v /var/run/dbus:/var/run/dbus -v /var/lib/fprint:/var/lib/fprint -v /home/pom/Projects/fingerprint-ocv/out/build/release/src/:/data --device /dev/bus/usb/001/002 localhost/fingerpp
-ExecStop=/bin/sh /usr/bin/stop_fprint
+Type=simple
+ExecStart=/usr/local/bin/fingerprint-ocv --bus=system
+Restart=on-failure
+RestartSec=2
+StateDirectory=fprint
+StateDirectoryMode=0700
+UMask=0077
 
 [Install]
-WantedBy=multi-user.target 
+WantedBy=multi-user.target

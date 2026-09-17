@@ -1,13 +1,13 @@
 [submodule "asyncdbus"]
 	path = asyncdbus
-	url = ../asyncdbus.git
+	url = https://github.com/vrolife/asyncdbus.git
 [submodule "asyncusb"]
 	path = asyncusb
-	url = ../asyncusb.git
+	url = https://github.com/vrolife/asyncusb.git
 [submodule "jinx"]
 	path = jinx
-	url = ../jinx.git
+	url = https://github.com/vrolife/jinx.git
 [submodule "vcpkg"]
 	path = vcpkg
-	url = git@github.com:microsoft/vcpkg.git
+	url = https://github.com/microsoft/vcpkg.git
 	branch = 2022.10.19

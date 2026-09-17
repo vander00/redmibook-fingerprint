@@ -1,0 +1,81 @@
+
+---
+events:
+  -
+    kind: "find-v1"
+    backtrace:
+      - "/usr/share/cmake/Modules/CMakeDetermineSystem.cmake:12 (find_program)"
+      - "CMakeLists.txt:10 (project)"
+    mode: "program"
+    variable: "CMAKE_UNAME"
+    description: "Path to a program."
+    settings:
+      SearchFramework: "NEVER"
+      SearchAppBundle: "NEVER"
+      CMAKE_FIND_USE_CMAKE_PATH: true
+      CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH: true
+      CMAKE_FIND_USE_CMAKE_SYSTEM_PATH: true
+      CMAKE_FIND_USE_INSTALL_PREFIX: true
+    names:
+      - "uname"
+    candidate_directories:
+      - "/home/raymond/.asdf/shims/"
+      - "/home/raymond/.local/share/mise/installs/claude/latest/"
+      - "/home/raymond/.local/share/mise/installs/codex/latest/bin/"
+      - "/home/raymond/.local/share/mise/installs/copilot/latest/"
+      - "/home/raymond/.local/share/mise/installs/gh/latest/gh_2.100.0_linux_amd64/bin/"
+      - "/home/raymond/.local/share/mise/installs/node/latest/bin/"
+      - "/home/raymond/.local/share/mise/shims/"
+      - "/home/raymond/.local/bin/"
+      - "/home/raymond/.local/share/omarchy/bin/"
+      - "/home/raymond/.cargo/bin/"
+      - "/usr/local/sbin/"
+      - "/usr/local/bin/"
+      - "/usr/bin/"
+      - "/home/raymond/.local/share/flatpak/exports/bin/"
+      - "/var/lib/flatpak/exports/bin/"
+      - "/usr/lib/jvm/default/bin/"
+      - "/usr/bin/site_perl/"
+      - "/usr/bin/vendor_perl/"
+      - "/usr/bin/core_perl/"
+      - "/usr/share/omarchy/bin/"
+      - "/bin/"
+    searched_directories:
+      - "/home/raymond/.asdf/shims/uname"
+      - "/home/raymond/.local/share/mise/installs/claude/latest/uname"
+      - "/home/raymond/.local/share/mise/installs/codex/latest/bin/uname"
+      - "/home/raymond/.local/share/mise/installs/copilot/latest/uname"
+      - "/home/raymond/.local/share/mise/installs/gh/latest/gh_2.100.0_linux_amd64/bin/uname"
+      - "/home/raymond/.local/share/mise/installs/node/latest/bin/uname"
+      - "/home/raymond/.local/share/mise/shims/uname"
+      - "/home/raymond/.local/bin/uname"
+      - "/home/raymond/.local/share/omarchy/bin/uname"
+      - "/home/raymond/.cargo/bin/uname"
+      - "/usr/local/sbin/uname"
+      - "/usr/local/bin/uname"
+    found: "/usr/bin/uname"
+    search_context:
+      ENV{PATH}:
+        - "/home/raymond/.asdf/shims"
+        - "/home/raymond/.local/share/mise/installs/claude/latest"
+        - "/home/raymond/.local/share/mise/installs/codex/latest/bin"
+        - "/home/raymond/.local/share/mise/installs/copilot/latest"
+        - "/home/raymond/.local/share/mise/installs/gh/latest/gh_2.100.0_linux_amd64/bin"
+        - "/home/raymond/.local/share/mise/installs/node/latest/bin"
+        - "/home/raymond/.local/share/mise/shims"
+        - "/home/raymond/.local/bin"
+        - "/home/raymond/.local/share/omarchy/bin"
+        - "/home/raymond/.local/share/../bin"
+        - "/home/raymond/.cargo/bin"
+        - "/usr/local/sbin"
+        - "/usr/local/bin"
+        - "/usr/bin"
+        - "/home/raymond/.local/share/flatpak/exports/bin"
+        - "/var/lib/flatpak/exports/bin"
+        - "/usr/lib/jvm/default/bin"
+        - "/usr/bin/site_perl"
+        - "/usr/bin/vendor_perl"
+        - "/usr/bin/core_perl"
+        - "/usr/share/omarchy/bin"
+...

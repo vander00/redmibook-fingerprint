@@ -48,7 +48,7 @@ target_link_libraries(fingerprint-ocv PRIVATE
 )
 set_target_properties(fingerprint-ocv PROPERTIES CXX_VISIBILITY_PRESET hidden)
 
-install(TARGETS fingerprint-ocv)
+install(TARGETS fingerprint-ocv RUNTIME DESTINATION bin)
 
 if (BUILD_TESTING)
 add_executable(test_fingerprint_multitemplate
