@@ -25,12 +25,25 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 namespace fpc {
 
+// The first five frames build distinct-area coverage. The remaining frames
+// add alignable angle, pressure, and nearby-placement variations.
+static constexpr size_t DISTINCT_AREA_POSITION_TEMPLATES = 5;
+static constexpr size_t MAX_POSITION_TEMPLATES = 10;
+static constexpr double MIN_NEW_POSITION_AREA_RATIO = 0.10;
+
+enum class EnrollmentSampleResult {
+    accepted,
+    unmatchable,
+    insufficient_new_area,
+};
+
 struct Fingerprint
 {
     std::string _user{};
     std::string _name{};
     cv::Mat _fingerprint{};
     cv::Mat _mask{};
+    std::vector<cv::Mat> _templates{};
 
     Fingerprint() = default;
     Fingerprint(Fingerprint&&) = default;
@@ -40,10 +53,15 @@ struct Fingerprint
     Fingerprint& operator =(Fingerprint&&) = default;
     Fingerprint& operator =(const Fingerprint&) = default;
 
-    bool merge(const cv::Mat& img);
-    bool match(const cv::Mat& img, float min_score, bool filter) const;
+    EnrollmentSampleResult merge(const cv::Mat& img);
+    bool match(
+        const cv::Mat& img,
+        float legacy_min_score,
+        float position_min_score,
+        bool filter) const;
 
     size_t total() const;
+    size_t template_count() const { return _templates.size(); }
 
     void write(cv::FileStorage& fstorage, int idx) const;
     void read(cv::FileStorage& fstorage, int idx);

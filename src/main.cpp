@@ -40,11 +40,12 @@ using namespace fingerpp;
 typedef AsyncImplement<libevent::EventEngineLibevent> async;
 typedef posix::AsyncIOPosix<libevent::EventEngineLibevent> asyncio;
 
-const std::array<Argument, 6> arguments
+const std::array<Argument, 7> arguments
 {{
     { "bus", "session", 1, 256, "dbus bus. 'system' or 'session'. default 'session'" },
     { "min-area", size_t(120000), size_t(1), size_t(0xFFFFFFFF), "min fingerprint area" },
     { "min-score", float(0.5), float(0.1), float(1.0), "min score" },
+    { "position-min-score", float(0.4), float(0.1), float(1.0), "multi-template min score" },
     { "data-path", "/var/lib/fprint", 1, 256, "data path" },
     { "filter-before-ssim", false, "filter image before MSSIM" },
     { "debug", false, "debug" }
@@ -54,7 +55,11 @@ const std::array<Argument, 6> arguments
 
 int main(int argc, const char* argv[])
 {
-    ::umask(0600);
+    // umask() takes the permission bits to REMOVE, not to keep. The original
+    // umask(0600) therefore stripped owner rw and left group/other write set,
+    // creating the fingerprint template database world-writable (mode 066).
+    // 0077 is what was meant: owner-only (0600) for new files.
+    ::umask(0077);
 
     openlog(argv[0], LOG_PID | LOG_NDELAY, LOG_AUTH | LOG_INFO);
     syslog(LOG_AUTH | LOG_INFO, "fingerpp starting");

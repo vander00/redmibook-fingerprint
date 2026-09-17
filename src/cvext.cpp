@@ -15,6 +15,8 @@ You should have received a copy of the GNU Affero General Public License
 along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 #include <iostream>
+#include <algorithm>
+#include <cmath>
 #include <opencv2/features2d.hpp>
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -24,10 +26,65 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 namespace cvext {
 
+bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter);
+bool merge_impl(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, cv::Mat& output, cv::Mat& output_mask);
+
+// Reject homographies that are geometrically implausible for a finger press on
+// a small area sensor. Loosening the ratio test below lets more (and noisier)
+// correspondences through, so we compensate here to keep false accepts down.
+static bool homography_is_sane(const cv::Mat& hmat)
+{
+    if (hmat.empty() or hmat.type() != CV_64F or hmat.rows != 3 or hmat.cols != 3) {
+        return false;
+    }
+
+    for (int row = 0; row < 3; ++row) {
+        for (int col = 0; col < 3; ++col) {
+            if (not std::isfinite(hmat.at<double>(row, col))) {
+                return false;
+            }
+        }
+    }
+
+    // Normalise so h22 == 1, then inspect the affine part.
+    double h22 = hmat.at<double>(2, 2);
+    if (std::abs(h22) < 1e-9) {
+        return false;
+    }
+
+    double a11 = hmat.at<double>(0, 0) / h22;
+    double a12 = hmat.at<double>(0, 1) / h22;
+    double a21 = hmat.at<double>(1, 0) / h22;
+    double a22 = hmat.at<double>(1, 1) / h22;
+
+    // Determinant of the linear part == area scaling. A genuine re-press of the
+    // same finger is near 1.0. The sensor is fixed size, so a real sample
+    // cannot legitimately need a 2x stretch to line up - observed bogus
+    // alignments scored ~0.07 while stretching ~2x, so keep this tight.
+    double det = (a11 * a22) - (a12 * a21);
+    if (std::abs(det) < 0.64 or std::abs(det) > 1.5625) {
+        return false;
+    }
+
+    // Perspective terms must stay small - the sensor is flat, so a real press
+    // is essentially a rotation + translation, not a strong projective warp.
+    double p20 = hmat.at<double>(2, 0) / h22;
+    double p21 = hmat.at<double>(2, 1) / h22;
+    if (std::abs(p20) > 0.01 or std::abs(p21) > 0.01) {
+        return false;
+    }
+
+    return true;
+}
+
 bool get_transform_matrix(const cv::Mat& img1, const cv::Mat& img2, cv::Mat& output, int min_match, cv::Point offset={0, 0})
 {
     assert(img1.type() == CV_8UC1);
     assert(img2.type() == CV_8UC1);
+
+    if (img1.empty() or img2.empty()) {
+        return false;
+    }
 
     auto sift = cv::SIFT::create();
     
@@ -39,8 +96,14 @@ bool get_transform_matrix(const cv::Mat& img1, const cv::Mat& img2, cv::Mat& out
     sift->detectAndCompute(img1, {}, keypoints1, descriptors1);
     sift->detectAndCompute(img2, {}, keypoints2, descriptors2);
 
-    std::vector<cv::Point> points1{};
-    std::vector<cv::Point> points2{};
+    // knnMatch(k=2) needs at least 2 train descriptors, and throws on empty
+    // input. A worn or badly placed finger really does produce this.
+    if (descriptors1.empty() or descriptors2.rows < 2) {
+        return false;
+    }
+
+    std::vector<cv::Point2f> points1{};
+    std::vector<cv::Point2f> points2{};
 
     std::for_each(keypoints1.begin(), keypoints1.end(), [&](cv::KeyPoint& keypoint){
         points1.push_back(keypoint.pt);
@@ -54,30 +117,52 @@ bool get_transform_matrix(const cv::Mat& img1, const cv::Mat& img2, cv::Mat& out
     std::vector<std::vector<cv::DMatch>> matches{};
     bf_matcher->knnMatch(descriptors1, descriptors2, matches, 2);
 
-    std::vector<std::pair<size_t, size_t>> good_idx{};
-    for(auto& vpair : matches) {
-        auto& match1 = vpair.at(0);
-        auto& match2 = vpair.at(1);
-
-        if (match1.distance < (0.6F * match2.distance)) {
-            good_idx.emplace_back(match1.queryIdx, match1.trainIdx);
-        }
-    }
-
-    if (good_idx.size() < min_match) {
-        return false;
-    }
+    // Lowe ratio test. The original 0.6 is very strict: on a degraded or
+    // partially-placed print it discards most true correspondences and the
+    // match fails outright. 0.75 is Lowe's own recommendation; the RANSAC
+    // inlier count and homography sanity check below filter the extra noise.
+    constexpr float kRatio = 0.75F;
 
     std::vector<cv::Point2f> good_points1{};
     std::vector<cv::Point2f> good_points2{};
 
-    std::for_each(good_idx.begin(), good_idx.end(), [&](std::pair<size_t, size_t> point){
-        good_points1.push_back(points1[point.first] + offset);
-        good_points2.push_back(points2[point.second]);
-    });
+    for(auto& vpair : matches) {
+        if (vpair.size() < 2) {
+            continue;
+        }
+        auto& match1 = vpair.at(0);
+        auto& match2 = vpair.at(1);
 
-    output = cv::findHomography(good_points2, good_points1, cv::RANSAC, 4);
-    return not output.empty();
+        if (match1.distance < (kRatio * match2.distance)) {
+            if (match1.queryIdx < 0 or match1.queryIdx >= (int)points1.size() or
+                match1.trainIdx < 0 or match1.trainIdx >= (int)points2.size()) {
+                continue;
+            }
+            good_points1.push_back(points1[match1.queryIdx] + cv::Point2f(offset));
+            good_points2.push_back(points2[match1.trainIdx]);
+        }
+    }
+
+    if ((int)good_points1.size() < min_match) {
+        return false;
+    }
+
+    cv::Mat inliers{};
+    output = cv::findHomography(good_points2, good_points1, cv::RANSAC, 4, inliers);
+
+    if (not homography_is_sane(output)) {
+        output.release();
+        return false;
+    }
+
+    // Require the homography to actually be supported by enough points, not
+    // just be computable from the 4-point minimum.
+    if (not inliers.empty() and cv::countNonZero(inliers) < min_match) {
+        output.release();
+        return false;
+    }
+
+    return true;
 }
 
 cv::Mat garbor_filter(
@@ -222,8 +307,12 @@ cv::Scalar MSSIM(cv::Mat& img1, cv::Mat& img2, cv::InputArray mask)
     return cv::mean(ssim_map, mask);
 }
 
-bool match(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter)
+bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter)
 {
+    if (fingerprint.empty() or fp_mask.empty() or partial.empty()) {
+        return false;
+    }
+
     cv::Mat matrix{};
 
     auto ret = cvext::get_transform_matrix(fingerprint, partial, matrix, min_match);
@@ -242,8 +331,20 @@ bool match(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& pa
 
     dst_mask.setTo(0.0F, fp_mask==0);
 
+    cv::Mat valid = dst_mask > 0;
+
+    // The score is a mean over the overlapping region only. If that region is
+    // tiny, the mean is statistically meaningless and can clear min_score by
+    // luck - which is both a false-accept risk and a source of flaky results.
+    // Demand a real overlap before trusting the score.
+    const int overlap_px = cv::countNonZero(valid);
+    const int min_overlap_px = static_cast<int>(partial.total() / 4);
+    if (overlap_px < min_overlap_px) {
+        return false;
+    }
+
     cv::Mat fpr{};
-    fingerprint.copyTo(fpr, dst_mask > 0);
+    fingerprint.copyTo(fpr, valid);
 
     cv::Scalar score{};
 
@@ -251,17 +352,29 @@ bool match(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& pa
         auto fpr_g = cvext::garbor_filter_block_wise(fpr, 32, 24);
         auto dst_g = cvext::garbor_filter_block_wise(dst_img, 32, 24);
 
-        score = MSSIM(fpr_g, dst_g, dst_mask > 0);
+        score = MSSIM(fpr_g, dst_g, valid);
 
     } else {
-        score = MSSIM(fpr, dst_img, dst_mask > 0);
+        score = MSSIM(fpr, dst_img, valid);
     }
+
+    // Log the actual score and overlap so thresholds can be tuned against real
+    // samples instead of guessed at.
+    std::cout << "match: score=" << score[0]
+              << " min_score=" << min_score
+              << " overlap=" << overlap_px
+              << "/" << partial.total()
+              << std::endl;
 
     return score[0] >= min_score;
 }
 
-bool merge(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, cv::Mat& output, cv::Mat& output_mask) 
+bool merge_impl(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, cv::Mat& output, cv::Mat& output_mask)
 {
+    if (img1.empty() or mask1.empty() or img2.empty()) {
+        return false;
+    }
+
     cv::Mat matrix{};
 
     auto offset = cv::Point(img2.size());
@@ -357,9 +470,50 @@ bool merge(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, cv::M
         bottom1 = bottom;
     }
 
+    // The warped corners can land outside the canvas (a rotated press near the
+    // sensor edge does this readily). cv::Range would then throw and, before
+    // the abort() fix, take the daemon with it. Clamp to the canvas instead so
+    // an off-angle sample is merged on its valid part rather than lost.
+    left1 = std::max(0, std::min<int>(left1, new_img1.cols - 1));
+    top1 = std::max(0, std::min<int>(top1, new_img1.rows - 1));
+    right1 = std::max(left1 + 1, std::min<int>(right1, new_img1.cols));
+    bottom1 = std::max(top1 + 1, std::min<int>(bottom1, new_img1.rows));
+
     output = new_img1(cv::Range{top1, bottom1}, cv::Range{left1, right1});
-    output_mask = weights1(cv::Range{top1, bottom1}, cv::Range{left1, right1});;
+    output_mask = weights1(cv::Range{top1, bottom1}, cv::Range{left1, right1});
     return true;
+}
+
+// Public entry points. OpenCV signals errors by throwing cv::Exception, and
+// these run inside the daemon's single-threaded event loop, so one bad sample
+// escaping as an exception terminates fingerpp (and logs the user out of
+// fingerprint auth entirely). A failed match/merge is a normal, expected
+// outcome for a smudged or off-angle press: report it as false and let the
+// caller ask for another scan.
+bool match(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter)
+{
+    try {
+        return match_impl(fingerprint, fp_mask, partial, min_match, min_score, filter);
+    } catch (const cv::Exception& exc) {
+        std::cerr << "match: opencv error: " << exc.what() << std::endl;
+        return false;
+    } catch (const std::exception& exc) {
+        std::cerr << "match: error: " << exc.what() << std::endl;
+        return false;
+    }
+}
+
+bool merge(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, cv::Mat& output, cv::Mat& output_mask)
+{
+    try {
+        return merge_impl(img1, mask1, img2, output, output_mask);
+    } catch (const cv::Exception& exc) {
+        std::cerr << "merge: opencv error: " << exc.what() << std::endl;
+        return false;
+    } catch (const std::exception& exc) {
+        std::cerr << "merge: error: " << exc.what() << std::endl;
+        return false;
+    }
 }
 
 }

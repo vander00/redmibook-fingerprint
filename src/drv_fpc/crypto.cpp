@@ -18,7 +18,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <cstring>
 
 #include <openssl/sha.h>
-#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <openssl/crypto.h>
+#include <openssl/params.h>
+#include <openssl/core_names.h>
 
 #include "crypto.hpp"
 
@@ -41,28 +44,24 @@ bool verify_tls_key(const void* aad, size_t aad_len, void* key, size_t key_len, 
 {
     unsigned char hmac_key[SHA256_DIGEST_LENGTH];
     unsigned char sig[SHA256_DIGEST_LENGTH];
-    unsigned int sig_len = 0;
+    size_t sig_len = 0;
 
     sha256("FPC_HMAC_KEY", 13, hmac_key);
 
-    // not working! I do not known why ~
-    // size_t sig_len = 0;
-    // EVP_PKEY *pkey = EVP_PKEY_new_mac_key(EVP_PKEY_HMAC, NULL, hmac_key, SHA256_DIGEST_LENGTH);
-    // EVP_MD_CTX* hmac = EVP_MD_CTX_new();
-    // EVP_DigestSignInit(hmac, NULL, EVP_sha256(), NULL, pkey);
-    // EVP_DigestSignUpdate(hmac, hdr->data + hdr->aad_offset, hdr->aad_len);
-    // EVP_DigestSignUpdate(hmac, hdr->data + hdr->key_offset, hdr->key_len);
-    // EVP_DigestSignFinal(hmac, sig, &sig_len);
-    // EVP_MD_CTX_free(hmac);
-    // EVP_PKEY_free(pkey);
-
-    HMAC_CTX* hmac = HMAC_CTX_new();
-    HMAC_Init(hmac, hmac_key, SHA256_DIGEST_LENGTH, EVP_sha256());
-    HMAC_Update(hmac, reinterpret_cast<const unsigned char*>(aad), aad_len);
-    HMAC_Update(hmac, reinterpret_cast<const unsigned char*>(key), key_len);
-    HMAC_Final(hmac, sig, &sig_len);
-    HMAC_CTX_free(hmac);
-    return md_len == SHA256_DIGEST_LENGTH and memcmp(sig, output, SHA256_DIGEST_LENGTH) == 0;
+    EVP_MAC* mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    EVP_MAC_CTX* hmac = EVP_MAC_CTX_new(mac);
+    OSSL_PARAM params[] = {
+        OSSL_PARAM_construct_utf8_string(
+            OSSL_MAC_PARAM_DIGEST, const_cast<char*>("SHA256"), 0),
+        OSSL_PARAM_construct_end()
+    };
+    EVP_MAC_init(hmac, hmac_key, sizeof(hmac_key), params);
+    EVP_MAC_update(hmac, reinterpret_cast<const unsigned char*>(aad), aad_len);
+    EVP_MAC_update(hmac, reinterpret_cast<const unsigned char*>(key), key_len);
+    EVP_MAC_final(hmac, sig, &sig_len, sizeof(sig));
+    EVP_MAC_CTX_free(hmac);
+    EVP_MAC_free(mac);
+    return md_len == SHA256_DIGEST_LENGTH and CRYPTO_memcmp(sig, output, SHA256_DIGEST_LENGTH) == 0;
 }
 
 bool encrypt(

@@ -34,6 +34,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <fstream>
 #include <sstream>
 #include <filesystem>
+#include <functional>
+#include <unordered_map>
 
 #include <libusb-1.0/libusb.h>
 #include <openssl/sha.h>
@@ -229,6 +231,11 @@ protected:
             _device_state->_finger_present = true;
             
         } else if (event._type == FPCEvent::FPP_Image) {
+            // The image has been captured, so the finger is no longer being
+            // read. The hardware gives us no FingerUp event, so _finger_present
+            // would otherwise latch true forever after the first press and the
+            // D-Bus property would always report a finger on the sensor.
+            _device_state->_finger_present = false;
             std::vector<unsigned char> pixels{};
             pixels.reserve(10000);
             size_t skip = 12;
@@ -277,7 +284,11 @@ protected:
                     if (not Fingerprint::is_any(_fingerprint._name) and _fingerprint._name != fingerprint._name) {
                         return false;
                     }
-                    ret = fingerprint.match(partial, GET_OPTION(float, "min-score"), GET_OPTION(bool, "filter-before-ssim"));
+                    ret = fingerprint.match(
+                        partial,
+                        GET_OPTION(float, "min-score"),
+                        GET_OPTION(float, "position-min-score"),
+                        GET_OPTION(bool, "filter-before-ssim"));
                     return ret; // return 'true' to break loop
                 });
 
@@ -292,27 +303,29 @@ protected:
             }
             auto ret = _fingerprint.merge(partial);
 
-            if (not ret) {
-                return send_signal("enroll-remove-and-retry", FALSE);
-            }
-            
-            auto num_pixels = _fingerprint.total();
-
-            auto min_area = GET_OPTION(size_t, "min-area");
-
-            auto rate =  (double)num_pixels / min_area;
-
-            std::cout << rate << std::endl;
-
-            if (num_pixels < min_area) {
-                int current_stage = (int)(rate * 10);
-                if (_stage < current_stage) {
-                    _stage += 1;
-                    return send_signal("enroll-stage-passed", FALSE);
+            if (ret != EnrollmentSampleResult::accepted) {
+                if (ret == EnrollmentSampleResult::insufficient_new_area) {
+                    std::cout << "enroll: position adds too little new area (reposition finger)" << std::endl;
+                } else {
+                    // Could not align this press with what has been collected
+                    // so far. Normal when the finger moved too far or the press
+                    // was too light.
+                    std::cout << "enroll: merge failed (reposition finger)" << std::endl;
                 }
                 return send_signal("enroll-remove-and-retry", FALSE);
             }
-            std::cout << "completed" << std::endl;
+            
+            auto template_count = _fingerprint.template_count();
+            std::cout << "enroll: templates=" << template_count
+                      << "/" << MAX_POSITION_TEMPLATES
+                      << " stitched_area=" << _fingerprint.total()
+                      << std::endl;
+
+            if (template_count < MAX_POSITION_TEMPLATES) {
+                _stage = static_cast<int>(template_count);
+                return send_signal("enroll-stage-passed", FALSE);
+            }
+            std::cout << "enroll: completed" << std::endl;
             _storage->insert_or_update(std::move(_fingerprint));
             _storage->save();
             return send_signal("enroll-completed", TRUE);
@@ -460,6 +473,184 @@ public:
     }
 };
 
+// Runs a polkit CheckAuthorization for a gated method call on its own task.
+// It must NOT run on the device task: dispatch is serial, so awaiting the
+// check there would also block the polkit agent helper's own calls (the
+// helper runs pam_fprintd, which calls Claim on this device). The helper's
+// Claim would then sit in the queue for the full ~25s bus timeout before
+// falling through to pam_unix - which is why the authentication dialog only
+// surfaced at the exact moment the enroll client timed out. Upstream fprintd
+// can afford a synchronous check because its blocking call keeps iterating
+// the GLib main loop; this runtime has no nested loop, so the check lives
+// here instead. On success the original call is re-queued into the device
+// message queue and dispatched through the normal path.
+class WorkerPolkitGate : public AsyncRoutine,
+    private Queue2<std::queue<AsyncDBusMessage>>::CallbackPut
+{
+    AsyncDBusConnection _connection{};
+    AsyncDBusMessage _msg{};
+    Queue2<std::queue<AsyncDBusMessage>>* _queue{};
+    std::function<void(const std::string&, bool)> _on_resolved{};
+    std::string _cancellation_id{};
+
+    AsyncDBusSendWithReply _send_with_reply{};
+    AsyncDBusSend _send_message{};
+
+    bool _check_sent{};
+    bool _resolved{};
+
+    std::string key() {
+        const char* sender = dbus_message_get_sender(_msg);
+        return std::string(sender == nullptr ? "" : sender) + ":"
+             + std::to_string(dbus_message_get_serial(_msg));
+    }
+
+public:
+    auto& operator ()(
+        AsyncDBusConnection connection,
+        AsyncDBusMessage msg,
+        Queue2<std::queue<AsyncDBusMessage>>* queue,
+        std::function<void(const std::string&, bool)> on_resolved)
+    {
+        _connection = std::move(connection);
+        _msg = std::move(msg);
+        _queue = queue;
+        _on_resolved = std::move(on_resolved);
+        _cancellation_id = "fingerpp-" + key();
+        async_start(&WorkerPolkitGate::send_check);
+        return *this;
+    }
+
+protected:
+    AsyncDBusMessage queue2_put() override { return std::move(_msg); }
+    void queue2_cancel_pending_put() override { }
+
+    void async_finalize() noexcept override {
+        if (_check_sent and not _resolved) {
+            // The caller vanished or released mid-check; withdraw the pending
+            // authentication so no orphaned dialog is left in the agent.
+            AsyncDBusMessage cancel{dbus_message_new_method_call(
+                "org.freedesktop.PolicyKit1",
+                "/org/freedesktop/PolicyKit1/Authority",
+                "org.freedesktop.PolicyKit1.Authority",
+                "CancelCheckAuthorization")};
+            if (cancel != nullptr) {
+                DBusMessageIter args{};
+                dbus_message_iter_init_append(cancel, &args);
+                const char* cid = _cancellation_id.c_str();
+                dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &cid);
+                dbus_connection_send(_connection, cancel, nullptr);
+                dbus_connection_flush(_connection);
+            }
+        }
+        AsyncRoutine::async_finalize();
+    }
+
+    Async send_check() {
+        const char* sender = dbus_message_get_sender(_msg);
+        if (sender == nullptr) {
+            return deny();
+        }
+
+        AsyncDBusMessage call{
+            dbus_message_new_method_call(
+                "org.freedesktop.PolicyKit1",
+                "/org/freedesktop/PolicyKit1/Authority",
+                "org.freedesktop.PolicyKit1.Authority",
+                "CheckAuthorization")
+        };
+        if (call == nullptr) {
+            return deny();
+        }
+
+        // CheckAuthorization(subject (sa{sv}), action_id s, details a{ss},
+        //                    flags u, cancellation_id s)
+        DBusMessageIter args{};
+        dbus_message_iter_init_append(call, &args);
+
+        // subject = ("system-bus-name", {"name": <sender unique name>})
+        {
+            DBusMessageIter subject{}, dict{}, entry{}, variant{};
+            const char* kind = "system-bus-name";
+            const char* key = "name";
+            dbus_message_iter_open_container(&args, DBUS_TYPE_STRUCT, nullptr, &subject);
+            dbus_message_iter_append_basic(&subject, DBUS_TYPE_STRING, &kind);
+            dbus_message_iter_open_container(&subject, DBUS_TYPE_ARRAY, "{sv}", &dict);
+            dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY, nullptr, &entry);
+            dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+            dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+            dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &sender);
+            dbus_message_iter_close_container(&entry, &variant);
+            dbus_message_iter_close_container(&dict, &entry);
+            dbus_message_iter_close_container(&subject, &dict);
+            dbus_message_iter_close_container(&args, &subject);
+        }
+
+        const char* action_id = "net.reactivated.fprint.device.enroll";
+        dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &action_id);
+
+        {
+            DBusMessageIter details{};
+            dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{ss}", &details);
+            dbus_message_iter_close_container(&args, &details);
+        }
+
+        // flags: 1 = AllowUserInteraction, required for a prompt to appear
+        dbus_uint32_t flags = 1;
+        dbus_message_iter_append_basic(&args, DBUS_TYPE_UINT32, &flags);
+
+        const char* cid = _cancellation_id.c_str();
+        dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &cid);
+
+        _check_sent = true;
+        // The reply is sent only after the user answers the agent prompt, so
+        // this needs much longer than the usual bus timeout.
+        return *this
+            / _send_with_reply(_connection, call, std::chrono::seconds(120))
+            / &WorkerPolkitGate::check_done;
+    }
+
+    Async check_done() {
+        _resolved = true;
+        auto& reply = _send_with_reply.get_result();
+
+        // Reply is (is_authorized b, is_challenge b, details a{ss}). Fail
+        // closed: missing polkit, a timed-out or malformed reply, and an
+        // explicit denial all take the same path.
+        bool authorized = false;
+        if (dbus_message_get_type(reply) == DBUS_MESSAGE_TYPE_METHOD_RETURN) {
+            DBusMessageIter iter{}, result{};
+            if (dbus_message_iter_init(reply, &iter) == TRUE
+                and dbus_message_iter_get_arg_type(&iter) == DBUS_TYPE_STRUCT) {
+                dbus_message_iter_recurse(&iter, &result);
+                if (dbus_message_iter_get_arg_type(&result) == DBUS_TYPE_BOOLEAN) {
+                    dbus_bool_t v = FALSE;
+                    dbus_message_iter_get_basic(&result, &v);
+                    authorized = (v == TRUE);
+                }
+            }
+        }
+
+        if (not authorized) {
+            return deny();
+        }
+
+        // Mark the call authorized, then hand it back to the device dispatch
+        // loop where it re-runs the normal per-method gate.
+        _on_resolved(key(), true);
+        _queue->put(this) >> JINX_IGNORE_RESULT;
+        return async_return();
+    }
+
+    Async deny() {
+        _on_resolved(key(), false);
+        AsyncDBusMessage reply{
+            dbus_message_new_error(_msg, "net.reactivated.Fprint.Error.PermissionDenied", "not authorized")
+        };
+        return *this / _send_message(_connection, reply) / &WorkerPolkitGate::async_return;
+    }
+};
+
 class WorkerDevice : public AsyncDBusObject {
     Queue<std::queue<FPCEvent>>* _event_queue{};
     Queue<std::queue<FPCEvent>>* _image_queue{};
@@ -480,9 +671,27 @@ class WorkerDevice : public AsyncDBusObject {
 
     DeviceState _device_state{};
 
+    // Finger name to report in VerifyFingerSelected, held across the await on
+    // the VerifyStart method return (see enroll_verify_start).
+    std::string _verify_finger_selected{};
+
     AsyncDBusSend _send_message{};
     AsyncDBusSendWithReply _send_with_reply{};
     Queue<std::queue<FPCEvent>>::Put _put_image{};
+    Queue<std::queue<FPCEvent>>::Put _put_event{};
+
+    // Polkit authorization gate state, keyed by "<sender>:<serial>" of the
+    // gated call (serials are per-connection, so the sender must be part of
+    // the key). A 'pending' entry means a WorkerPolkitGate task owns the
+    // check; 'authorized' means the call was re-queued and may proceed;
+    // 'finished' entries are pruned lazily because a task cannot remove its
+    // own map entry without a use-after-free.
+    struct AuthGate {
+        TaskPtr task{};
+        std::string sender{};
+        enum class State { pending, authorized, finished } state{State::pending};
+    };
+    std::unordered_map<std::string, AuthGate> _auth_gates{};
 
 public:
     WorkerDevice() = default;
@@ -533,7 +742,7 @@ public:
 
         _device_name = device_id;
         _scan_type = "press";
-        _num_enroll_stages = 10;
+        _num_enroll_stages = static_cast<int>(MAX_POSITION_TEMPLATES);
         _device_state._finger_present = false;
         _device_state._finger_needed = true;
 
@@ -664,6 +873,105 @@ protected:
         return AsyncDBusObject::handle_message();
     }
 
+    // Drop all authorization gates belonging to a sender: cancel pending
+    // checks (which withdraws the agent prompt via CancelCheckAuthorization)
+    // and tombstone already-authorized serials so a re-queued call sitting
+    // in the message queue is dropped by check_polkit instead of spawning a
+    // fresh check.
+    void drop_auth_gates(const char* sender) {
+        for (auto it = _auth_gates.begin(); it != _auth_gates.end();) {
+            if (it->second.sender != sender) {
+                ++it;
+                continue;
+            }
+            if (it->second.state == AuthGate::State::authorized) {
+                it->second.state = AuthGate::State::finished;
+                ++it;
+            } else {
+                if (it->second.task != nullptr) {
+                    async_cancel(it->second.task) >> JINX_IGNORE_RESULT;
+                }
+                it = _auth_gates.erase(it);
+            }
+        }
+    }
+
+    // Gate state-changing methods through polkit. The uid/claim checks above
+    // prove only that the caller is who they claim to be - any local user
+    // could enroll or delete their own fingerprints from an unattended
+    // session with no prompt at all. Stock fprintd asks polkit before these
+    // same operations via the "net.reactivated.fprint.device.enroll" action
+    // (auth_self_keep: re-enter your own password), so this restores the
+    // standard contract using the policy file every distro's fprintd package
+    // already ships. Root is always authorised, so the documented
+    // `sudo fprintd-enroll` flow keeps working without a prompt.
+    //
+    // The check runs on a side task (see WorkerPolkitGate) and the call is
+    // re-queued once authorized; awaiting it here would park the serial
+    // dispatch loop and starve the polkit helper's own Claim call, making
+    // the agent dialog appear only after the client had timed out.
+    Async check_polkit() {
+        auto& msg = get_message();
+        const char* sender = dbus_message_get_sender(msg);
+        if (sender == nullptr) {
+            AsyncDBusMessage reply{
+                dbus_message_new_error(msg, "net.reactivated.Fprint.Error.PermissionDenied", "no sender")
+            };
+            return *this / _send_message(_connection, reply) / &WorkerDevice::run;
+        }
+
+        const std::string key = std::string(sender) + ":" + std::to_string(dbus_message_get_serial(msg));
+        auto gate = _auth_gates.find(key);
+        if (gate != _auth_gates.end()) {
+            // This call was re-queued by its gate. Only an authorized call
+            // proceeds; the denial path already replied to the caller.
+            const bool authorized = gate->second.state == AuthGate::State::authorized;
+            _auth_gates.erase(gate);
+            if (not authorized) {
+                return run();
+            }
+            const auto* method = dbus_message_get_member(msg);
+            if (jinx::hash::hash_string(method) == jinx::hash::hash_string("DeleteEnrolledFingers")) {
+                return get_uid();
+            }
+            return check_sender();
+        }
+
+        // Reject early if the device is claimed by someone else - the
+        // re-queued call will fail check_sender() anyway, and skipping the
+        // prompt avoids a dialog that can never succeed (upstream checks
+        // claim state before asking polkit too).
+        if (_claimed and _claimed_sender != sender) {
+            AsyncDBusMessage reply{
+                dbus_message_new_error(msg, "net.reactivated.Fprint.Error.AlreadyInUse", "device already in use")
+            };
+            return *this / _send_message(_connection, reply) / &WorkerDevice::run;
+        }
+
+        // Prune resolved gates left by earlier calls.
+        for (auto it = _auth_gates.begin(); it != _auth_gates.end();) {
+            if (it->second.state == AuthGate::State::finished) {
+                it = _auth_gates.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        AsyncDBusMessage parked{dbus_message_ref(msg)};
+        TaskPtr task = task_new<WorkerPolkitGate>(
+            _connection, std::move(parked), get_message_queue(),
+            [this](const std::string& done_key, bool authorized) {
+                auto it = _auth_gates.find(done_key);
+                if (it != _auth_gates.end()) {
+                    it->second.state = authorized ? AuthGate::State::authorized
+                                                  : AuthGate::State::finished;
+                }
+            });
+        _auth_gates.emplace(key, AuthGate{task, sender});
+        // The gate owns the reply now; keep dispatching other messages.
+        return run();
+    }
+
     Async handle_message() override {
         auto& msg = get_message();
         const auto* method = dbus_message_get_member(msg);
@@ -674,15 +982,16 @@ protected:
 
         switch(method_key) {
             case "ListEnrolledFingers"_hash:
-            case "DeleteEnrolledFingers"_hash:
             case "Claim"_hash:
                 return get_uid();
-            case "EnrollStop"_hash:
             case "EnrollStart"_hash:
+            case "DeleteEnrolledFinger"_hash:
+            case "DeleteEnrolledFingers"_hash:
+            case "DeleteEnrolledFingers2"_hash:
+                return check_polkit();
+            case "EnrollStop"_hash:
             case "VerifyStop"_hash:
             case "VerifyStart"_hash:
-            case "DeleteEnrolledFinger"_hash:
-            case "DeleteEnrolledFingers2"_hash:
             case "Release"_hash:
                 return check_sender();
             default: break;
@@ -808,11 +1117,18 @@ protected:
             if (_enroll_verify_task != nullptr) {
                 async_cancel(_enroll_verify_task) >> JINX_IGNORE_RESULT;
                 _enroll_verify_task.reset();
+                // A cancelled task can leave a pending Get on _image_queue;
+                // clear it so a later Put cannot wake a dead awaitable
+                // (PendingGetError).
+                _image_queue->reset();
             }
+            drop_auth_gates(old_owner);
             _claimed = false;
             _claimed_sender.clear();
             _claimed_user.clear();
-            return send_enroll_stop();
+            // The cancelled task cannot consume EnrollVerifyStop, so stop
+            // the sensor directly (no-op if it was already idle).
+            return *this / _put_event(_event_queue, FPCEvent{FPCEvent::FPP_StopSensor, {}, {}}) / &WorkerDevice::run;
         }
 
         return run();
@@ -853,6 +1169,7 @@ protected:
 
     Async release() {
         auto& msg = get_message();
+        const char* sender = dbus_message_get_sender(msg);
 
         if (_name_owner_chaged_task != nullptr) {
             _name_owner_chaged_task->resume({}) >> JINX_IGNORE_RESULT;
@@ -863,6 +1180,10 @@ protected:
             _enroll_verify_task->resume({}) >> JINX_IGNORE_RESULT;
             _enroll_verify_task.reset();
         }
+
+        // A release during a pending check must not leave an orphaned agent
+        // prompt or let a late authorization re-queue the gated call.
+        drop_auth_gates(sender);
 
         _claimed = false;
         _claimed_sender.clear();
@@ -923,10 +1244,62 @@ protected:
             _storage,
             is_verify);
 
+        // VerifyFingerSelected must be emitted for a prompt to appear anywhere:
+        // pam_fprintd uses it to produce the PAM info message "Place your
+        // finger on <device>", and GNOME Shell turns that message into the
+        // "(or place finger on reader)" hint under the password field.
+        // Upstream declared the signal in the interface above and never sent
+        // it, so verification worked while the reader looked dead.
+        //
+        // ORDERING IS PART OF THE CONTRACT. pam_fprintd calls VerifyStart
+        // asynchronously and only sets its internal `verify_started` flag in
+        // the method-return callback. Its VerifyFingerSelected handler starts
+        // with:
+        //
+        //     if (!data->verify_started) { "Unexpected ... signal"; return 0; }
+        //
+        // so a signal that reaches the client BEFORE the method return is
+        // parsed, logged as unexpected, and dropped - no PAM message, no GNOME
+        // hint. Emitting it first therefore looks correct on the wire and still
+        // produces no prompt.
+        //
+        // Both the reply and the signal go out via dbus_connection_send(),
+        // which appends to a single ordered outgoing queue, and D-Bus preserves
+        // per-sender ordering. So the reply is awaited first and the signal is
+        // emitted from the continuation below, guaranteeing the client sees
+        // return-then-signal.
         AsyncDBusMessage reply{
             dbus_message_new_method_return(get_message())
         };
+
+        if (is_verify) {
+            _verify_finger_selected = finger_name;
+            return *this
+                / _send_message(_connection, reply)
+                / &WorkerDevice::send_verify_finger_selected;
+        }
+
         return *this / _send_message(_connection, reply) / &WorkerDevice::run;
+    }
+
+    // Continuation of enroll_verify_start() for the verify case: runs only
+    // after the VerifyStart method return has been queued, so pam_fprintd has
+    // already set verify_started by the time this signal reaches it.
+    Async send_verify_finger_selected() {
+        AsyncDBusMessage finger_signal{
+            dbus_message_new_signal(
+                _dbus_path.c_str(),
+                "net.reactivated.Fprint.Device",
+                "VerifyFingerSelected")
+        };
+        if (finger_signal == nullptr) {
+            return run();
+        }
+        const char* finger_name = _verify_finger_selected.c_str();
+        DBusMessageIter sig_iter{};
+        dbus_message_iter_init_append(finger_signal, &sig_iter);
+        dbus_message_iter_append_basic(&sig_iter, DBUS_TYPE_STRING, &finger_name);
+        return *this / _send_message(_connection, finger_signal) / &WorkerDevice::run;
     }
 
     Async enroll_verify_stop() {
