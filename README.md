@@ -17,15 +17,9 @@ lsusb -d 10a5:9201
 Other devices are not supported by this driver.
 
 ## Install
-
-The installer supports Ubuntu/Debian, Arch Linux and derivatives, and Fedora.
-It installs the required packages and enables the systemd service. It first
-tries to download a compatible binary from the latest GitHub release. If no
-binary is available, it builds the driver from source instead.
-
-Release binaries should be named `fingerprint-ocv-linux-x86_64` or
-`fingerprint-ocv-linux-aarch64`. The legacy `fingerprint-ocv` name is also
-accepted on x86-64.
+The installer only works for systemd systems.
+It downloads the latest binary from the releases.
+It can also build from source for Arch, Debian/Ubuntu, Fedora linux systems.
 
 ```bash
 git clone https://github.com/vander00/redmibook-fingerprint.git
