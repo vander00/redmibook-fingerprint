@@ -90,10 +90,12 @@ struct FPCEvent
         FPP_StopSensor,
         FPP_FingerDown,
         FPP_Image,
-        FPP_EnrollVerifyStop
+        FPP_EnrollVerifyStop,
+        FPP_TransportFailed
     } _type;
     struct fpc_event _ev;
     std::vector<FPCBuffer> _buffers{};
+    error::Error _error{};
 };
 
 static void start(fingerpp::Manager* manager, fingerpp::USBDeviceInfo* info, USBDeviceHandle&& handle);
@@ -332,6 +334,14 @@ protected:
 
         } else if (event._type == FPCEvent::FPP_EnrollVerifyStop) {
             return *this / _put_event(_event_queue, FPCEvent{FPCEvent::FPP_StopSensor, {}, {}}) / &WorkerEnrollVerify::async_return;
+        } else if (event._type == FPCEvent::FPP_TransportFailed) {
+            // A suspended USB device invalidates the active scan. Complete
+            // the D-Bus operation before the controller tears the session
+            // down, otherwise PAM clients keep waiting on a scan that can
+            // never produce another image.
+            return send_signal(
+                _verify ? "verify-unknown-error" : "enroll-unknown-error",
+                TRUE);
         }
         return wait_image();
     }
@@ -1515,6 +1525,28 @@ protected:
         AsyncRoutine::async_finalize();
     }
 
+    Async handle_error(const error::Error& error) override {
+        auto state = AsyncRoutine::handle_error(error);
+        if (state != ControlState::Raise) {
+            return state;
+        }
+
+        if (error.category() == category_awaitable()
+            and error.as<ErrorAwaitable>() == ErrorAwaitable::Cancelled)
+        {
+            return async_return();
+        }
+
+        // TLS state is tied to the current USB session. A suspend can leave
+        // OpenSSL with a partial record or handshake. Notify the controller
+        // through the normal event path: Queue::reset() resumes and clears
+        // waiters at once, which is unsafe while one of them is being reused.
+        jinx_log_warning() << "TLS transport failed: " << error.message() << std::endl;
+        return *this
+            / _put_event(_event_queue, FPCEvent{FPCEvent::FPP_TransportFailed, {}, {}, error})
+            / &TLSEventReader::async_return;
+    }
+
     Async accept() {
         return *this / _pipe->_ssl_server.accept() / &TLSEventReader::ready;
     }
@@ -1537,16 +1569,18 @@ protected:
 
         if (_mode == ModeInitial) {
             auto& front = _buffers.front();
-            assert(front->capacity() > sizeof(fpc_event));
-
             auto buf = front->slice_for_consumer();
             if (buf._size < sizeof(fpc_event)) {
                 jinx_log_error() << "invalid data length\n";
-                abort();
+                return async_throw(make_error(LIBUSB_ERROR_IO));
             }
 
             const auto* event = reinterpret_cast<const fpc_event*>(buf.data());
             _event_length = ntohl(event->len);
+            if (_event_length < sizeof(fpc_event)) {
+                jinx_log_error() << "invalid TLS event length\n";
+                return async_throw(make_error(LIBUSB_ERROR_IO));
+            }
             _mode = ModeRecv;
         }
         
@@ -1556,14 +1590,19 @@ protected:
             }
         }
 
-        assert(_received_length == _event_length);
+        if (_received_length != _event_length) {
+            jinx_log_error() << "TLS event length mismatch\n";
+            return async_throw(make_error(LIBUSB_ERROR_IO));
+        }
         _received_length = 0;
         _mode = ModeInitial;
         {
             auto& front = _buffers.front();
             auto buf = front->slice_for_consumer();
             front->consume(sizeof(fpc_event)).abort_on(Failed_, "buffer overflow");
-            assert(buf._size >= sizeof(fpc_event));
+            if (buf._size < sizeof(fpc_event)) {
+                return async_throw(make_error(LIBUSB_ERROR_IO));
+            }
             auto event = *reinterpret_cast<const fpc_event*>(buf.data());
             event.code = ntohl(event.code);
             event.len = ntohl(event.len);
@@ -1640,16 +1679,19 @@ protected:
             return state;
         }
 
-        if (error.category() == jinx::usb::category_usb()) {
-            if (static_cast<libusb_error>(error.value()) == LIBUSB_ERROR_NO_DEVICE) {
-                _event_queue->reset();
-                return async_return();
-            }
-        } else if (error.category() == jinx::usb::category_transfer()) {
-            if (static_cast<libusb_transfer_status>(error.value()) == LIBUSB_TRANSFER_NO_DEVICE) {
-                _event_queue->reset();
-                return async_return();
-            }
+        if (error.category() == category_awaitable()
+            and error.as<ErrorAwaitable>() == ErrorAwaitable::Cancelled)
+        {
+            return async_return();
+        }
+
+        if (error.category() == jinx::usb::category_usb()
+            or error.category() == jinx::usb::category_transfer())
+        {
+            jinx_log_warning() << "USB input failed: " << error.message() << std::endl;
+            return *this
+                / _put_event(_event_queue, FPCEvent{FPCEvent::FPP_TransportFailed, {}, {}, error})
+                / &USBInput::async_return;
         }
 
         return state;
@@ -1687,8 +1729,6 @@ protected:
 
         if (_mode == ModeInitial) {
             auto& front = _buffers.front();
-            assert(front->capacity() > sizeof(fpc_event));
-
             auto buf = front->slice_for_consumer();
             if (buf._size < sizeof(fpc_event)) {
                 return recv();
@@ -1696,6 +1736,10 @@ protected:
 
             const auto* event = reinterpret_cast<const fpc_event*>(buf.data());
             _event_length = ntohl(event->len);
+            if (_event_length < sizeof(fpc_event)) {
+                jinx_log_error() << "invalid USB event length\n";
+                return async_throw(make_error(LIBUSB_ERROR_IO));
+            }
             _mode = ModeRecv;
         }
         
@@ -1705,14 +1749,19 @@ protected:
             }
         }
 
-        assert(_received_length == _event_length);
+        if (_received_length != _event_length) {
+            jinx_log_error() << "USB event length mismatch\n";
+            return async_throw(make_error(LIBUSB_ERROR_IO));
+        }
         _received_length = 0;
         _mode = ModeInitial;
         {
             auto& front = _buffers.front();
             auto buf = front->slice_for_consumer();
             front->consume(sizeof(fpc_event)).abort_on(Failed_, "buffer overflow");
-            assert(buf._size >= sizeof(fpc_event));
+            if (buf._size < sizeof(fpc_event)) {
+                return async_throw(make_error(LIBUSB_ERROR_IO));
+            }
             auto event = *reinterpret_cast<const fpc_event*>(buf.data());
             event.code = ntohl(event.code);
             event.len = ntohl(event.len);
@@ -1744,21 +1793,25 @@ class USBOutput : public AsyncRoutine {
     libusb_device_handle* _handle{};
     libusb_endpoint_descriptor _endpoint;
     BIOPipePtr _pipe{};
+    Queue<std::queue<FPCEvent>>* _event_queue{nullptr};
     
     HeapBuffer _buffer{};
     buffer::BufferView _payload{};
 
     jinx::usb::USBControlTransfer _control_transfer{};
+    Queue<std::queue<FPCEvent>>::Put _put_event{};
 
 public:
     USBOutput& operator ()(
         libusb_device_handle* handle, 
         libusb_endpoint_descriptor& endpoint, 
-        BIOPipePtr& pipe) 
+        BIOPipePtr& pipe,
+        Queue<std::queue<FPCEvent>>* queue)
     {
         _handle = handle;
         _endpoint = endpoint;
         _pipe = pipe;
+        _event_queue = queue;
 
         auto size = LIBUSB_CONTROL_SETUP_SIZE + _endpoint.wMaxPacketSize;
         _buffer = HeapBuffer{
@@ -1770,6 +1823,7 @@ public:
 
 protected:
     void async_finalize() noexcept override {
+        _put_event.reset();
         _pipe.reset();
         _buffer.reset();
         AsyncRoutine::async_finalize();
@@ -1781,14 +1835,19 @@ protected:
             return state;
         }
 
-        if (error.category() == jinx::usb::category_usb()) {
-            if (static_cast<libusb_error>(error.value()) == LIBUSB_ERROR_NO_DEVICE) {
-                return async_return();
-            }
-        } else if (error.category() == jinx::usb::category_transfer()) {
-            if (static_cast<libusb_transfer_status>(error.value()) == LIBUSB_TRANSFER_NO_DEVICE) {
-                return async_return();
-            }
+        if (error.category() == category_awaitable()
+            and error.as<ErrorAwaitable>() == ErrorAwaitable::Cancelled)
+        {
+            return async_return();
+        }
+
+        if (error.category() == jinx::usb::category_usb()
+            or error.category() == jinx::usb::category_transfer())
+        {
+            jinx_log_warning() << "USB output failed: " << error.message() << std::endl;
+            return *this
+                / _put_event(_event_queue, FPCEvent{FPCEvent::FPP_TransportFailed, {}, {}, error})
+                / &USBOutput::async_return;
         }
 
         return state;
@@ -1839,6 +1898,8 @@ class WorkerControl : public AsyncRoutine
     Queue<std::queue<FPCEvent>>::Put _put_image{};
     jinx::usb::USBControlTransfer _control_transfer{};
     async::Sleep _sleep{};
+    size_t _recovery_attempt{};
+    error::Error _recovery_error{};
 
 public:
     WorkerControl& operator ()(
@@ -1851,7 +1912,11 @@ public:
         _handle = std::move(handle);
         _ready = false;
         _device_info->_attached = true;
-        async_start(&WorkerControl::init);
+        if (_handle == nullptr) {
+            async_start(&WorkerControl::schedule_recovery);
+        } else {
+            async_start(&WorkerControl::init);
+        }
         return *this;
     }
 
@@ -1864,6 +1929,7 @@ protected:
             return false;
         }
 
+        bool found = false;
         for (int intf_idx = 0 ; intf_idx < config_desc->bNumInterfaces; ++intf_idx) {
             const struct libusb_interface* iface = &config_desc->interface[intf_idx];
             for (int intf_desc_idx = 0 ; intf_desc_idx < iface->num_altsetting; ++intf_desc_idx) {
@@ -1873,22 +1939,23 @@ protected:
                     if (endp_desc->bEndpointAddress == 0x82) {
                         *interface = *iface_desc;
                         *endpoint = *endp_desc;
-                        return true;
+                        found = true;
+                        break;
                     }
                 }
+                if (found) break;
             }
+            if (found) break;
         }
-        return false;
+        libusb_free_config_descriptor(config_desc);
+        return found;
     }
 
-    void async_finalize() noexcept override {
-        _get_event.reset();
-        _put_image.reset();
-        _event_queue.reset();
-        _image_queue.reset();
-
-        _device_info->_attached = false;
-
+    void cleanup_device() noexcept {
+        // Cancel all queue users before clearing queued values. Resetting a
+        // Jinx queue first resumes its waiters while their operations are
+        // still linked, which can make a later reused Get fail with
+        // PendingGetError.
         if (_device_task != nullptr) {
             async_cancel(_device_task) >> JINX_IGNORE_RESULT;
             _device_task.reset();
@@ -1898,7 +1965,12 @@ protected:
             async_cancel(task) >> JINX_IGNORE_RESULT;
         }
         _tasks.clear();
-        
+
+        _get_event.reset();
+        _put_image.reset();
+        _event_queue.reset();
+        _image_queue.reset();
+
         std::fill(_tls_key.begin(), _tls_key.end(), 0);
         _tls_key.clear();
 
@@ -1906,21 +1978,82 @@ protected:
             libusb_release_interface(_handle, _interface.bInterfaceNumber);
         }
         _handle.reset();
+        _interface = {};
+        _endpoint = {};
         _pipe.reset();
+        _ready = false;
+    }
 
+    void async_finalize() noexcept override {
+        cleanup_device();
+        _device_info->_attached = false;
         AsyncRoutine::async_finalize();
     }
 
-    void restart() {
-        USBDeviceHandle handle{};
-        
-        auto* device = libusb_get_device(_handle);
-        assert(device != nullptr);
+    std::chrono::milliseconds recovery_delay() const noexcept {
+        static constexpr std::chrono::milliseconds delays[] = {
+            std::chrono::milliseconds(500),
+            std::chrono::seconds(1),
+            std::chrono::seconds(2),
+            std::chrono::seconds(5),
+            std::chrono::seconds(10),
+            std::chrono::seconds(30),
+        };
+        auto index = std::min(_recovery_attempt, std::size(delays) - 1);
+        return delays[index];
+    }
 
-        auto ret = libusb_open(device, handle.address());
-        if (ret == 0) {
-            fpc9201::start(_manager, _device_info, std::move(handle));
+    Async schedule_recovery() {
+        auto delay = recovery_delay();
+        ++_recovery_attempt;
+        jinx_log_warning() << "fingerprint sensor recovery attempt "
+                           << _recovery_attempt << " in " << delay.count() << " ms" << std::endl;
+        return *this / _sleep(delay) / &WorkerControl::reopen;
+    }
+
+    Async begin_recovery(const error::Error& error) {
+        jinx_log_warning() << "fingerprint sensor session failed: "
+                           << error.message() << std::endl;
+        cleanup_device();
+        return schedule_recovery();
+    }
+
+    Async notify_operation_failed(const error::Error& error) {
+        _recovery_error = error;
+        if (_device_task == nullptr) {
+            return begin_recovery(error);
         }
+
+        return *this
+            / _put_image(&_image_queue, FPCEvent{FPCEvent::FPP_TransportFailed, {}, {}, error})
+            / &WorkerControl::yield_recovery;
+    }
+
+    Async yield_recovery() {
+        // Let WorkerEnrollVerify send its terminal VerifyStatus/EnrollStatus
+        // signal before cleanup cancels that task and the USB session.
+        return async_yield(&WorkerControl::resume_recovery);
+    }
+
+    Async resume_recovery() {
+        return begin_recovery(_recovery_error);
+    }
+
+    Async reopen() {
+        USBDeviceHandle handle{
+            libusb_open_device_with_vid_pid(
+                _manager->get_usb(),
+                _device_info->_vendor,
+                _device_info->_product)};
+        if (handle == nullptr) {
+            return schedule_recovery();
+        }
+
+        _handle = std::move(handle);
+        _interface = {};
+        _endpoint = {};
+        jinx_log_info() << "fingerprint sensor reopened" << std::endl;
+        return init();
     }
 
     Async handle_error(const error::Error& error) override {
@@ -1931,13 +2064,11 @@ protected:
 
         if (error.category() == category_awaitable()) {
             if (static_cast<ErrorAwaitable>(error.value()) == ErrorAwaitable::Cancelled) {
-                restart();
-                return async_return();
+                return begin_recovery(error);
             }
-        } else if (error.category() == category_transfer()) {
-            if (static_cast<libusb_transfer_status>(error.value()) == LIBUSB_TRANSFER_STALL) {
-                libusb_clear_halt(_handle, _endpoint.bEndpointAddress);
-            }
+        } else if (error.category() == category_transfer()
+                   or error.category() == category_usb()) {
+            return begin_recovery(error);
         }
 
         return state;
@@ -1949,7 +2080,10 @@ protected:
             jinx_log_error() << "endpoint not found\n";
             return async_throw(make_error(LIBUSB_ERROR_NOT_FOUND));
         }
-        libusb_claim_interface(_handle, _interface.bInterfaceNumber);
+        ret = libusb_claim_interface(_handle, _interface.bInterfaceNumber);
+        if (ret < 0) {
+            return async_throw(make_error(static_cast<libusb_error>(ret)));
+        }
 
         // TODO cmd_get_unique_id
         device_unique_id = "fpc9201";
@@ -2005,7 +2139,7 @@ protected:
         );
         
         _tasks.emplace_back(
-            task_new<USBOutput>(_handle, _endpoint, _pipe)
+            task_new<USBOutput>(_handle, _endpoint, _pipe, &_event_queue)
         );
                 
         _tasks.emplace_back(
@@ -2053,7 +2187,8 @@ protected:
                 }
                     break;
                 case ev_tls:
-                    abort();
+                    jinx_log_error() << "unexpected nested TLS event\n";
+                    return async_throw(make_error(LIBUSB_ERROR_IO));
                 case ev_finger_down:
                     if (_ready) {
                         return *this / _put_image(&_image_queue, FPCEvent{FPCEvent::FPP_FingerDown, {}, {}}) / &WorkerControl::delay_get_image;
@@ -2097,12 +2232,14 @@ protected:
                     jinx_log_warning() << "tls event ev_refresh_sensor" << std::endl;
                     break;
                 default:
-                    jinx_log_error() << "unknown event code";
-                    abort();
+                    jinx_log_error() << "unknown event code\n";
+                    return async_throw(make_error(LIBUSB_ERROR_IO));
             }
 
         } else if (event._type == FPCEvent::TLS_Ready) {
             _ready = true;
+            _recovery_attempt = 0;
+            jinx_log_info() << "fingerprint sensor ready" << std::endl;
 
             // initialize storage
             std::filesystem::path storage_path{GET_OPTION(std::string, "data-path")};
@@ -2131,6 +2268,9 @@ protected:
 
         } else if (event._type == FPCEvent::FPP_StopSensor) {
             return stop_sensor();
+
+        } else if (event._type == FPCEvent::FPP_TransportFailed) {
+            return notify_operation_failed(event._error);
         }
         return get_event();
     }
@@ -2144,13 +2284,13 @@ protected:
             || (hdr->key_offset + hdr->key_len) > data_length
             || (hdr->sig_offset + hdr->sig_len) > data_length) 
         {
-            fprintf(stderr, "invalid tls key packet\n");
-            abort();
+            jinx_log_error() << "invalid TLS key packet\n";
+            return async_throw(make_error(LIBUSB_ERROR_IO));
         }
 
         if (memcmp("FPC TLS Keys", hdr->data + hdr->aad_offset, 13) != 0) {
-            fprintf(stderr, "bad aad failed\n");
-            abort();
+            jinx_log_error() << "invalid TLS key AAD\n";
+            return async_throw(make_error(LIBUSB_ERROR_IO));
         }
 
         if (not crypto::verify_tls_key(
@@ -2161,8 +2301,8 @@ protected:
             hdr->data + hdr->sig_offset, 
             hdr->sig_len))
         {
-            fprintf(stderr, "bad aad failed\n");
-            abort();
+            jinx_log_error() << "TLS key signature verification failed\n";
+            return async_throw(make_error(LIBUSB_ERROR_IO));
         }
 
         unsigned char sealing_key[SHA256_DIGEST_LENGTH];
@@ -2305,10 +2445,10 @@ static void device_attached(fingerpp::Manager* manager, fingerpp::USBDeviceInfo*
 {
     if (connected) {
         USBDeviceHandle handle{};
-        libusb_open(device, handle.address());
-        if (handle == nullptr) {
-            std::cerr << "Unable open device " << std::hex << info->_vendor << ":" << info->_product;
-            abort();
+        auto ret = libusb_open(device, handle.address());
+        if (ret < 0) {
+            jinx_log_warning() << "unable to open fingerprint device: "
+                               << libusb_error_name(ret) << "; scheduling recovery" << std::endl;
         }
         start(manager, info, std::move(handle));
     }
