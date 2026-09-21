@@ -48,13 +48,13 @@ is reinstalled.
 Check whether the service is running:
 
 ```bash
-systemctl status fingerprint-ocv.service
+systemctl status fprintd.service
 ```
 
 View its recent logs:
 
 ```bash
-journalctl -u fingerprint-ocv.service -b --no-pager
+journalctl -u fprintd.service -b --no-pager
 ```
 
 To rebuild after pulling an update, run `./install.sh` again.
@@ -78,10 +78,10 @@ sudo cmake --install build --prefix /usr/local
 ## Uninstall
 
 ```bash
-sudo systemctl disable --now fingerprint-ocv.service
-sudo rm /etc/systemd/system/fingerprint-ocv.service
+sudo rm /etc/systemd/system/fprintd.service.d/20-fingerprint-ocv.conf
 sudo rm /usr/local/bin/fingerprint-ocv
 sudo systemctl daemon-reload
+sudo systemctl restart fprintd.service
 ```
 
 The uninstall commands intentionally leave enrolled fingerprints in

@@ -5,7 +5,8 @@ set -Eeuo pipefail
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly BUILD_DIR="${BUILD_DIR:-${SCRIPT_DIR}/build/install}"
 readonly INSTALL_PREFIX="/usr/local"
-readonly SERVICE_NAME="fingerprint-ocv.service"
+readonly SERVICE_NAME="fprintd.service"
+readonly SERVICE_DROP_IN="fprintd-fingerprint-ocv.conf"
 readonly RELEASE_BASE_URL="https://github.com/vander00/redmibook-fingerprint/releases/latest/download"
 DOWNLOAD_DIR=""
 RELEASE_BINARY=""
@@ -167,16 +168,16 @@ else
     run_as_root cmake --install "${BUILD_DIR}" --prefix "${INSTALL_PREFIX}"
 fi
 
-log "Installing the system service"
+log "Installing the system service override"
 run_as_root install -Dm644 \
-    "${SCRIPT_DIR}/${SERVICE_NAME}" \
-    "/etc/systemd/system/${SERVICE_NAME}"
+    "${SCRIPT_DIR}/${SERVICE_DROP_IN}" \
+    "/etc/systemd/system/${SERVICE_NAME}.d/20-fingerprint-ocv.conf"
 
-# The distribution fprintd daemon owns the same D-Bus name. Stop a running
-# instance before systemd starts this replacement implementation.
-run_as_root systemctl stop fprintd.service 2>/dev/null || true
+# Disable the legacy standalone unit when upgrading.  Running behind the
+# standard fprintd unit preserves D-Bus activation and prevents another
+# provider from taking net.reactivated.Fprint during a restart.
+run_as_root systemctl disable --now fingerprint-ocv.service 2>/dev/null || true
 run_as_root systemctl daemon-reload
-run_as_root systemctl enable "${SERVICE_NAME}"
 run_as_root systemctl restart "${SERVICE_NAME}"
 
 if ! run_as_root systemctl is-active --quiet "${SERVICE_NAME}"; then

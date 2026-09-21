@@ -1,0 +1,17 @@
+[Unit]
+Description=FPC 10a5:9201 fingerprint driver
+After=dbus.service
+Requires=dbus.service
+Conflicts=fprintd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fingerprint-ocv --bus=system
+Restart=on-failure
+RestartSec=2
+StateDirectory=fprint
+StateDirectoryMode=0700
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
