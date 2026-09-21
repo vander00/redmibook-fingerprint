@@ -1640,7 +1640,7 @@ protected:
             return state;
         }
 
-        if (error.category() == jinx::usb::category_transfer()) {
+        if (error.category() == jinx::usb::category_usb()) {
             if (static_cast<libusb_error>(error.value()) == LIBUSB_ERROR_NO_DEVICE) {
                 _event_queue->reset();
                 return async_return();
