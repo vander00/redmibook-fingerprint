@@ -19,12 +19,14 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <iostream>
 #include <algorithm>
 #include <cmath>
+#include <array>
 
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <openssl/aes.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <opencv2/imgproc.hpp>
 
 #include "jinx/logging.hpp"
@@ -34,6 +36,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 namespace fpc {
 using namespace std::string_literals;
+namespace {
+constexpr std::array<unsigned char, 8> STORAGE_MAGIC{'F', 'P', 'C', 'D', 'B', 'v', '2', '!'};
+constexpr size_t STORAGE_NONCE_SIZE = 12;
+}
 
 EnrollmentSampleResult Fingerprint::merge(const cv::Mat& img)
 {
@@ -45,6 +51,8 @@ EnrollmentSampleResult Fingerprint::merge(const cv::Mat& img)
         _mask.create(_fingerprint.size(), CV_32F);
         _mask.setTo(1.0F);
         _templates.push_back(img.clone());
+        _anchor_count = 1;
+        _learning_stats.emplace_back();
         return EnrollmentSampleResult::accepted;
     }
 
@@ -68,6 +76,8 @@ EnrollmentSampleResult Fingerprint::merge(const cv::Mat& img)
 
     if (_templates.size() < ENROLLMENT_POSITION_TEMPLATES) {
         _templates.push_back(img.clone());
+        ++_anchor_count;
+        _learning_stats.emplace_back();
     }
     return EnrollmentSampleResult::accepted;
 }
@@ -76,8 +86,12 @@ bool Fingerprint::match(
     const cv::Mat &img,
     float legacy_min_score,
     float position_min_score,
-    bool filter) const
+    bool filter,
+    size_t* matched_template) const
 {
+    if (matched_template != nullptr) {
+        *matched_template = std::numeric_limits<size_t>::max();
+    }
     // Position-specific frames avoid forcing every verification press to align
     // against a large stitched canvas. They use the same hardened
     // SIFT/RANSAC/SSIM acceptance path and threshold as the legacy template;
@@ -87,6 +101,9 @@ bool Fingerprint::match(
         mask.setTo(1.0F);
         if (cvext::match(_templates[idx], mask, img, 4, position_min_score, filter)) {
             std::cout << "match: position-template=" << idx << std::endl;
+            if (matched_template != nullptr) {
+                *matched_template = idx;
+            }
             return true;
         }
     }
@@ -99,6 +116,108 @@ bool Fingerprint::match(
         return cvext::match(_fingerprint, _mask, img, 4, legacy_min_score, filter);
     }
     return false;
+}
+
+bool Fingerprint::strong_anchor_match(const cv::Mat& img) const
+{
+    for (size_t idx = 0; idx < std::min(_anchor_count, _templates.size()); ++idx) {
+        cvext::MatchEvidence evidence{};
+        if (cvext::strong_match(_templates[idx], img, 0.30, evidence)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void Fingerprint::record_verification_use(size_t matched_template)
+{
+    if (_learning_stats.size() <= _anchor_count) {
+        return;
+    }
+    // Every successful verification is a chance for a learned position to
+    // contribute. A hit is credited only when no original anchor matched.
+    for (size_t idx = _anchor_count; idx < _learning_stats.size(); ++idx) {
+        auto& stats = _learning_stats[idx];
+        if (stats.opportunities < static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+            ++stats.opportunities;
+        }
+    }
+    if (matched_template >= _anchor_count and
+        matched_template < _learning_stats.size()) {
+        auto& winner = _learning_stats[matched_template];
+        if (winner.hits < static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+            ++winner.hits;
+        }
+    }
+    if (_unsaved_usage < std::numeric_limits<unsigned>::max()) {
+        ++_unsaved_usage;
+    }
+}
+
+bool Fingerprint::observe_verified_scan(const cv::Mat& img, bool unique_anchor)
+{
+    if (not unique_anchor or not strong_anchor_match(img) or
+        _anchor_count == 0 or _anchor_count >= MAX_POSITION_TEMPLATES) {
+        return false;
+    }
+
+    // Keep only genuinely new positions. A strong match to an original scan
+    // is mandatory even when the candidate resembles a learned position.
+    for (const auto& saved : _templates) {
+        double overlap = 0.0;
+        if (cvext::enrollment_match(saved, img, overlap) and
+            overlap > 1.0 - MIN_NEW_POSITION_AREA_RATIO) {
+            return false;
+        }
+    }
+
+    size_t replace = std::numeric_limits<size_t>::max();
+    if (_templates.size() >= MAX_POSITION_TEMPLATES) {
+        // A learned position must have had ten chances to prove useful before
+        // it can be replaced. Smooth sparse hit rates so new slots survive.
+        for (size_t idx = _anchor_count; idx < _learning_stats.size(); ++idx) {
+            const auto& stats = _learning_stats[idx];
+            if (stats.opportunities < 10) {
+                continue;
+            }
+            if (replace == std::numeric_limits<size_t>::max()) {
+                replace = idx;
+                continue;
+            }
+            const auto& weakest = _learning_stats[replace];
+            const uint64_t candidate_rate = (uint64_t(stats.hits) + 1) * (uint64_t(weakest.opportunities) + 10);
+            const uint64_t weakest_rate = (uint64_t(weakest.hits) + 1) * (uint64_t(stats.opportunities) + 10);
+            if (candidate_rate < weakest_rate or
+                (candidate_rate == weakest_rate and stats.sequence < weakest.sequence)) {
+                replace = idx;
+            }
+        }
+        if (replace == std::numeric_limits<size_t>::max()) {
+            return false;
+        }
+    }
+
+    cvext::MatchEvidence pending_evidence{};
+    if (_pending_template.empty() or
+        not cvext::strong_match(_pending_template, img, 0.75, pending_evidence)) {
+        _pending_template = img.clone();
+        return false;
+    }
+
+    _pending_template.release();
+    LearningStats fresh{};
+    if (_learning_sequence < static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        ++_learning_sequence;
+    }
+    fresh.sequence = _learning_sequence;
+    if (replace == std::numeric_limits<size_t>::max()) {
+        _templates.push_back(img.clone());
+        _learning_stats.push_back(fresh);
+    } else {
+        _templates[replace] = img.clone();
+        _learning_stats[replace] = fresh;
+    }
+    return true;
 }
 
 size_t Fingerprint::total() const
@@ -125,10 +244,21 @@ void Fingerprint::write(cv::FileStorage& fstorage, int idx) const
 
     name = "template_count"s + std::to_string(idx);
     fstorage << name << static_cast<int>(_templates.size());
+    name = "anchor_count"s + std::to_string(idx);
+    fstorage << name << static_cast<int>(_anchor_count);
+    name = "learning_sequence"s + std::to_string(idx);
+    fstorage << name << static_cast<int>(_learning_sequence);
 
     for (size_t template_idx = 0; template_idx < _templates.size(); ++template_idx) {
         name = "template"s + std::to_string(idx) + "_"s + std::to_string(template_idx);
         fstorage << name << _templates[template_idx];
+        if (template_idx >= _anchor_count and template_idx < _learning_stats.size()) {
+            const auto& stats = _learning_stats[template_idx];
+            const auto suffix = std::to_string(idx) + "_"s + std::to_string(template_idx);
+            fstorage << "learned_hits"s + suffix << static_cast<int>(stats.hits);
+            fstorage << "learned_opportunities"s + suffix << static_cast<int>(stats.opportunities);
+            fstorage << "learned_sequence"s + suffix << static_cast<int>(stats.sequence);
+        }
     }
 }
 
@@ -158,6 +288,27 @@ void Fingerprint::read(cv::FileStorage& fstorage, int idx)
             _templates.push_back(fstorage[name].mat());
         }
     }
+    name = "anchor_count"s + std::to_string(idx);
+    _anchor_count = fstorage[name].empty()
+        ? _templates.size() // Pre-adaptation records are all trusted originals.
+        : static_cast<size_t>(std::clamp(static_cast<int>(fstorage[name]), 0,
+                                          static_cast<int>(_templates.size())));
+    name = "learning_sequence"s + std::to_string(idx);
+    _learning_sequence = fstorage[name].empty() ? 0
+        : static_cast<uint32_t>(std::max(0, static_cast<int>(fstorage[name])));
+    _learning_stats.assign(_templates.size(), {});
+    for (size_t template_idx = _anchor_count; template_idx < _templates.size(); ++template_idx) {
+        const auto suffix = std::to_string(idx) + "_"s + std::to_string(template_idx);
+        auto& stats = _learning_stats[template_idx];
+        const auto hits = fstorage["learned_hits"s + suffix];
+        const auto opportunities = fstorage["learned_opportunities"s + suffix];
+        const auto sequence = fstorage["learned_sequence"s + suffix];
+        if (not hits.empty()) stats.hits = std::max(0, static_cast<int>(hits));
+        if (not opportunities.empty()) stats.opportunities = std::max(0, static_cast<int>(opportunities));
+        if (not sequence.empty()) stats.sequence = std::max(0, static_cast<int>(sequence));
+    }
+    _pending_template.release();
+    _unsaved_usage = 0;
 }
     
 void FingerprintStorage::load()
@@ -179,9 +330,6 @@ void FingerprintStorage::load()
     std::vector<unsigned char> encrypted{};
     encrypted.resize(filesize);
 
-    std::vector<unsigned char> data{};
-    data.resize(filesize - 16);
-
     FILE* file = fopen(_filename.c_str(), "rb");
     if (file == nullptr) {
         return;
@@ -195,15 +343,21 @@ void FingerprintStorage::load()
         return;
     }
 
+    const bool new_format = encrypted.size() >= STORAGE_MAGIC.size() + STORAGE_NONCE_SIZE + 16 and
+        std::equal(STORAGE_MAGIC.begin(), STORAGE_MAGIC.end(), encrypted.begin());
+    const size_t payload_offset = new_format ? STORAGE_MAGIC.size() + STORAGE_NONCE_SIZE : 0;
+    std::vector<unsigned char> data(encrypted.size() - payload_offset - 16);
     jinx::SliceConst key{_key.data(), _key.size()};
-    jinx::SliceConst nonce{_key.data(), 12};
+    jinx::SliceConst nonce{
+        new_format ? encrypted.data() + STORAGE_MAGIC.size() : _key.data(),
+        STORAGE_NONCE_SIZE};
 
     auto ret = crypto::decrypt(
         EVP_chacha20_poly1305(), 
         key, 
         nonce, 
         key, 
-        {encrypted.data(), encrypted.size() - 16}, 
+        {encrypted.data() + payload_offset, data.size()},
         {data.data(), data.size()}, 
         {encrypted.data() + encrypted.size() - 16, 16});
 
@@ -223,7 +377,7 @@ void FingerprintStorage::load()
     }
 }
 
-void FingerprintStorage::save()
+bool FingerprintStorage::save()
 {
     cv::FileStorage fstorage{"memory", cv::FileStorage::WRITE | cv::FileStorage::MEMORY | cv::FileStorage::FORMAT_JSON};
     int count = 0;
@@ -239,20 +393,29 @@ void FingerprintStorage::save()
     auto data = fstorage.releaseAndGetString();
 
     std::vector<unsigned char> encrypted{};
-    encrypted.resize(data.size() + 16);
+    const size_t payload_offset = STORAGE_MAGIC.size() + STORAGE_NONCE_SIZE;
+    encrypted.resize(payload_offset + data.size() + 16);
+    std::copy(STORAGE_MAGIC.begin(), STORAGE_MAGIC.end(), encrypted.begin());
+    if (RAND_bytes(encrypted.data() + STORAGE_MAGIC.size(), STORAGE_NONCE_SIZE) != 1) {
+        jinx_log_error() << "random fingerprint database nonce failed";
+        return false;
+    }
 
     jinx::SliceConst key{_key.data(), _key.size()};
-    jinx::SliceConst nonce{_key.data(), 12};
+    jinx::SliceConst nonce{encrypted.data() + STORAGE_MAGIC.size(), STORAGE_NONCE_SIZE};
 
-    crypto::encrypt(
+    if (not crypto::encrypt(
         EVP_chacha20_poly1305(), 
         key, 
         nonce, 
         key, 
         {data.data(), 
         data.size()}, 
-        {encrypted.data(), data.size()},
-        {encrypted.data() + data.size(), 16});
+        {encrypted.data() + payload_offset, data.size()},
+        {encrypted.data() + payload_offset + data.size(), 16})) {
+        jinx_log_error() << "encrypt fingerprint database failed";
+        return false;
+    }
 
     // Write atomically: serialise to a temporary file, fsync it, then rename
     // over the real one. The original opened the live database with "wb", which
@@ -268,7 +431,7 @@ void FingerprintStorage::save()
         // pointer, crashing the daemon on any write failure (read-only mount,
         // full disk, bad permissions).
         jinx_log_error() << "write " << tmp_filename << " failed: " << strerror(errno);
-        return;
+        return false;
     }
 
     bool ok = fwrite(encrypted.data(), encrypted.size(), 1, file) == 1;
@@ -290,19 +453,23 @@ void FingerprintStorage::save()
 
     if (not ok) {
         ::unlink(tmp_filename.c_str());
-        return;
+        return false;
     }
 
     // Match the intended 0600 before the file becomes the live database, so
     // there is no window where it is readable by others.
     if (::chmod(tmp_filename.c_str(), S_IRUSR | S_IWUSR) != 0) {
         jinx_log_error() << "chmod " << tmp_filename << " failed: " << strerror(errno);
+        ::unlink(tmp_filename.c_str());
+        return false;
     }
 
     if (::rename(tmp_filename.c_str(), _filename.c_str()) != 0) {
         jinx_log_error() << "rename to " << _filename << " failed: " << strerror(errno);
         ::unlink(tmp_filename.c_str());
+        return false;
     }
+    return true;
 }
 
 void FingerprintStorage::init(const std::string &filename, const std::vector<unsigned char>& key)
@@ -328,6 +495,47 @@ void FingerprintStorage::insert_or_update(Fingerprint&& fingerprint)
     } else {
         print->second = std::move(fingerprint);
     }
+}
+
+Fingerprint* FingerprintStorage::unique_strong_anchor(
+    const std::string& username, const cv::Mat& img)
+{
+    Fingerprint* found = nullptr;
+    bool ambiguous = false;
+    foreach(username, [&](Fingerprint& print) {
+        if (print.strong_anchor_match(img)) {
+            if (found != nullptr) {
+                ambiguous = true;
+                return true;
+            }
+            found = &print;
+        }
+        return false;
+    });
+    return ambiguous ? nullptr : found;
+}
+
+bool FingerprintStorage::update_after_verification(
+    Fingerprint& fingerprint, const cv::Mat& img, bool unique_anchor)
+{
+    Fingerprint before = fingerprint;
+    try {
+        if (fingerprint.observe_verified_scan(img, unique_anchor)) {
+            if (not save()) {
+                fingerprint = std::move(before);
+                return false;
+            }
+            fingerprint.usage_saved();
+            return true;
+        }
+        if (fingerprint.usage_save_due() and save()) {
+            fingerprint.usage_saved();
+        }
+    } catch (const std::exception& exc) {
+        fingerprint = std::move(before);
+        jinx_log_error() << "adaptive fingerprint update failed: " << exc.what();
+    }
+    return false;
 }
 
 }

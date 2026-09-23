@@ -20,6 +20,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <cstdint>
+#include <limits>
 
 #include "cvext.hpp"
 
@@ -41,11 +43,22 @@ enum class EnrollmentSampleResult {
 
 struct Fingerprint
 {
+    struct LearningStats {
+        uint32_t hits{};
+        uint32_t opportunities{};
+        uint32_t sequence{};
+    };
+
     std::string _user{};
     std::string _name{};
     cv::Mat _fingerprint{};
     cv::Mat _mask{};
     std::vector<cv::Mat> _templates{};
+    size_t _anchor_count{};
+    std::vector<LearningStats> _learning_stats{};
+    uint32_t _learning_sequence{};
+    cv::Mat _pending_template{}; // Never persisted or used for verification.
+    unsigned _unsaved_usage{};
 
     Fingerprint() = default;
     Fingerprint(Fingerprint&&) = default;
@@ -60,7 +73,13 @@ struct Fingerprint
         const cv::Mat& img,
         float legacy_min_score,
         float position_min_score,
-        bool filter) const;
+        bool filter,
+        size_t* matched_template = nullptr) const;
+    bool strong_anchor_match(const cv::Mat& img) const;
+    bool observe_verified_scan(const cv::Mat& img, bool unique_anchor);
+    void record_verification_use(size_t matched_template);
+    bool usage_save_due() const { return _unsaved_usage >= 20; }
+    void usage_saved() { _unsaved_usage = 0; }
 
     size_t total() const;
     size_t template_count() const { return _templates.size(); }
@@ -140,9 +159,12 @@ public:
     }
 
     void insert_or_update(Fingerprint&& fingerprint);
+    Fingerprint* unique_strong_anchor(const std::string& username, const cv::Mat& img);
+    bool update_after_verification(Fingerprint& fingerprint, const cv::Mat& img,
+                                   bool unique_anchor);
     
     void load();
-    void save();
+    bool save();
 
     void reset() {
         _filename.clear();

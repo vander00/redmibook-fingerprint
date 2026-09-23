@@ -26,7 +26,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 namespace cvext {
 
-bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter, double min_overlap_ratio, double* overlap_ratio);
+bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter, double min_overlap_ratio, double* overlap_ratio, MatchEvidence* evidence);
 bool merge_impl(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, cv::Mat& output, cv::Mat& output_mask);
 
 // Reject homographies that are geometrically implausible for a finger press on
@@ -77,7 +77,7 @@ static bool homography_is_sane(const cv::Mat& hmat)
     return true;
 }
 
-bool get_transform_matrix(const cv::Mat& img1, const cv::Mat& img2, cv::Mat& output, int min_match, cv::Point offset={0, 0})
+bool get_transform_matrix(const cv::Mat& img1, const cv::Mat& img2, cv::Mat& output, int min_match, cv::Point offset={0, 0}, int* inlier_count=nullptr)
 {
     assert(img1.type() == CV_8UC1);
     assert(img2.type() == CV_8UC1);
@@ -157,9 +157,14 @@ bool get_transform_matrix(const cv::Mat& img1, const cv::Mat& img2, cv::Mat& out
 
     // Require the homography to actually be supported by enough points, not
     // just be computable from the 4-point minimum.
-    if (not inliers.empty() and cv::countNonZero(inliers) < min_match) {
+    const int supported = inliers.empty() ? 0 : cv::countNonZero(inliers);
+    if (not inliers.empty() and supported < min_match) {
         output.release();
         return false;
+    }
+
+    if (inlier_count != nullptr) {
+        *inlier_count = supported;
     }
 
     return true;
@@ -307,7 +312,7 @@ cv::Scalar MSSIM(cv::Mat& img1, cv::Mat& img2, cv::InputArray mask)
     return cv::mean(ssim_map, mask);
 }
 
-bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter, double min_overlap_ratio, double* overlap_ratio)
+bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter, double min_overlap_ratio, double* overlap_ratio, MatchEvidence* evidence)
 {
     if (fingerprint.empty() or fp_mask.empty() or partial.empty()) {
         return false;
@@ -315,7 +320,8 @@ bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Ma
 
     cv::Mat matrix{};
 
-    auto ret = cvext::get_transform_matrix(fingerprint, partial, matrix, min_match);
+    int inliers = 0;
+    auto ret = cvext::get_transform_matrix(fingerprint, partial, matrix, min_match, {0, 0}, &inliers);
     if (not ret) {
         return  false;
     }
@@ -338,7 +344,7 @@ bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Ma
     // luck - which is both a false-accept risk and a source of flaky results.
     // Demand a real overlap before trusting the score.
     const int overlap_px = cv::countNonZero(valid);
-    const int min_overlap_px = overlap_ratio == nullptr
+    const int min_overlap_px = overlap_ratio == nullptr and evidence == nullptr
         ? static_cast<int>(partial.total() / 4)
         : static_cast<int>(std::ceil(partial.total() * min_overlap_ratio));
     if (overlap_px < min_overlap_px) {
@@ -373,6 +379,9 @@ bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Ma
     }
     if (overlap_ratio != nullptr) {
         *overlap_ratio = static_cast<double>(overlap_px) / partial.total();
+    }
+    if (evidence != nullptr) {
+        *evidence = MatchEvidence{score[0], static_cast<double>(overlap_px) / partial.total(), inliers};
     }
     return true;
 }
@@ -501,7 +510,7 @@ bool merge_impl(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, 
 bool match(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter)
 {
     try {
-        return match_impl(fingerprint, fp_mask, partial, min_match, min_score, filter, 0.25, nullptr);
+        return match_impl(fingerprint, fp_mask, partial, min_match, min_score, filter, 0.25, nullptr, nullptr);
     } catch (const cv::Exception& exc) {
         std::cerr << "match: opencv error: " << exc.what() << std::endl;
         return false;
@@ -518,12 +527,31 @@ bool enrollment_match(const cv::Mat& fingerprint, const cv::Mat& partial, double
             return false;
         }
         cv::Mat mask{fingerprint.size(), CV_32F, cv::Scalar{1.0F}};
-        return match_impl(fingerprint, mask, partial, 6, 0.4, false, 0.15, &overlap_ratio);
+        return match_impl(fingerprint, mask, partial, 6, 0.4, false, 0.15, &overlap_ratio, nullptr);
     } catch (const cv::Exception& exc) {
         std::cerr << "enrollment match: opencv error: " << exc.what() << std::endl;
         return false;
     } catch (const std::exception& exc) {
         std::cerr << "enrollment match: error: " << exc.what() << std::endl;
+        return false;
+    }
+}
+
+bool strong_match(const cv::Mat& fingerprint, const cv::Mat& partial,
+                  double min_overlap, MatchEvidence& evidence)
+{
+    try {
+        if (fingerprint.empty() or partial.empty()) {
+            return false;
+        }
+        cv::Mat mask{fingerprint.size(), CV_32F, cv::Scalar{1.0F}};
+        return match_impl(fingerprint, mask, partial, 8, 0.60, false,
+                          min_overlap, nullptr, &evidence) and evidence.inliers >= 8;
+    } catch (const cv::Exception& exc) {
+        std::cerr << "strong match: opencv error: " << exc.what() << std::endl;
+        return false;
+    } catch (const std::exception& exc) {
+        std::cerr << "strong match: error: " << exc.what() << std::endl;
         return false;
     }
 }

@@ -22,6 +22,12 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 namespace cvext {
 
+struct MatchEvidence {
+    double score{};
+    double overlap{};
+    int inliers{};
+};
+
 template<typename T>
 void gamma(const cv::Mat& input, cv::Mat& output, double gamma)
 {
@@ -42,6 +48,8 @@ bool match(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& pa
 // smaller overlap and reports it for the distinct-position check.
 bool enrollment_match(const cv::Mat& fingerprint, const cv::Mat& partial, double& overlap_ratio);
 bool has_enrollment_features(const cv::Mat& image);
+bool strong_match(const cv::Mat& fingerprint, const cv::Mat& partial,
+                  double min_overlap, MatchEvidence& evidence);
 
 }
 

@@ -282,6 +282,8 @@ protected:
 #endif
             if (_verify) {
                 bool ret = false;
+                Fingerprint* matched = nullptr;
+                size_t matched_template = std::numeric_limits<size_t>::max();
                 _storage->foreach(_fingerprint._user, [&](auto& fingerprint){
                     if (not Fingerprint::is_any(_fingerprint._name) and _fingerprint._name != fingerprint._name) {
                         return false;
@@ -290,13 +292,24 @@ protected:
                         partial,
                         GET_OPTION(float, "min-score"),
                         GET_OPTION(float, "position-min-score"),
-                        GET_OPTION(bool, "filter-before-ssim"));
+                        GET_OPTION(bool, "filter-before-ssim"),
+                        &matched_template);
+                    if (ret) {
+                        matched = &fingerprint;
+                    }
                     return ret; // return 'true' to break loop
                 });
 
                 std::cout << "verify " << ret << std::endl;
 
                 if (ret) {
+                    bool unique_anchor = true;
+                    if (Fingerprint::is_any(_fingerprint._name)) {
+                        unique_anchor = _storage->unique_strong_anchor(
+                            _fingerprint._user, partial) == matched;
+                    }
+                    matched->record_verification_use(matched_template);
+                    _storage->update_after_verification(*matched, partial, unique_anchor);
                     return send_signal("verify-match", TRUE);
                 }
 
