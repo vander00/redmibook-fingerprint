@@ -38,6 +38,11 @@ bool merge(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, cv::M
 
 bool match(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter);
 
+// Enrollment uses the same alignment and image score as match, but permits a
+// smaller overlap and reports it for the distinct-position check.
+bool enrollment_match(const cv::Mat& fingerprint, const cv::Mat& partial, double& overlap_ratio);
+bool has_enrollment_features(const cv::Mat& image);
+
 }
 
 #endif

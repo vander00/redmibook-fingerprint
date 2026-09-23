@@ -309,21 +309,17 @@ protected:
                 if (ret == EnrollmentSampleResult::insufficient_new_area) {
                     std::cout << "enroll: position adds too little new area (reposition finger)" << std::endl;
                 } else {
-                    // Could not align this press with what has been collected
-                    // so far. Normal when the finger moved too far or the press
-                    // was too light.
-                    std::cout << "enroll: merge failed (reposition finger)" << std::endl;
+                    std::cout << "enroll: no credible overlap with a saved scan (move back slightly and retry)" << std::endl;
                 }
                 return send_signal("enroll-remove-and-retry", FALSE);
             }
             
             auto template_count = _fingerprint.template_count();
             std::cout << "enroll: templates=" << template_count
-                      << "/" << MAX_POSITION_TEMPLATES
-                      << " stitched_area=" << _fingerprint.total()
+                      << "/" << ENROLLMENT_POSITION_TEMPLATES
                       << std::endl;
 
-            if (template_count < MAX_POSITION_TEMPLATES) {
+            if (template_count < ENROLLMENT_POSITION_TEMPLATES) {
                 _stage = static_cast<int>(template_count);
                 return send_signal("enroll-stage-passed", FALSE);
             }
@@ -752,7 +748,7 @@ public:
 
         _device_name = device_id;
         _scan_type = "press";
-        _num_enroll_stages = static_cast<int>(MAX_POSITION_TEMPLATES);
+        _num_enroll_stages = static_cast<int>(ENROLLMENT_POSITION_TEMPLATES);
         _device_state._finger_present = false;
         _device_state._finger_needed = true;
 

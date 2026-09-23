@@ -38,6 +38,9 @@ using namespace std::string_literals;
 EnrollmentSampleResult Fingerprint::merge(const cv::Mat& img)
 {
     if (_fingerprint.empty()) {
+        if (not cvext::has_enrollment_features(img)) {
+            return EnrollmentSampleResult::unmatchable;
+        }
         _fingerprint = img.clone();
         _mask.create(_fingerprint.size(), CV_32F);
         _mask.setTo(1.0F);
@@ -45,27 +48,25 @@ EnrollmentSampleResult Fingerprint::merge(const cv::Mat& img)
         return EnrollmentSampleResult::accepted;
     }
 
-    cv::Mat output{};
-    cv::Mat mask{};
-    auto ret = cvext::merge(_fingerprint, _mask, img, output, mask);
-    if (not ret) {
-        return EnrollmentSampleResult::unmatchable;
-    }
-
-    if (_templates.size() < DISTINCT_AREA_POSITION_TEMPLATES) {
-        const auto current_area = total();
-        const auto candidate_area = static_cast<size_t>(cv::sum(mask)[0]);
-        const auto minimum_gain = static_cast<size_t>(
-            std::ceil(static_cast<double>(img.total()) * MIN_NEW_POSITION_AREA_RATIO));
-        const auto area_gain = candidate_area > current_area ? candidate_area - current_area : 0;
-        if (area_gain < minimum_gain) {
-            return EnrollmentSampleResult::insufficient_new_area;
+    bool linked = false;
+    bool repeated_position = false;
+    for (const auto& saved : _templates) {
+        double overlap_ratio = 0.0;
+        if (cvext::enrollment_match(saved, img, overlap_ratio)) {
+            linked = true;
+            if (overlap_ratio > 1.0 - MIN_NEW_POSITION_AREA_RATIO) {
+                repeated_position = true;
+            }
         }
     }
+    if (not linked) {
+        return EnrollmentSampleResult::unmatchable;
+    }
+    if (_templates.size() < DISTINCT_AREA_POSITION_TEMPLATES and repeated_position) {
+        return EnrollmentSampleResult::insufficient_new_area;
+    }
 
-    _fingerprint = std::move(output);
-    _mask = std::move(mask);
-    if (_templates.size() < MAX_POSITION_TEMPLATES) {
+    if (_templates.size() < ENROLLMENT_POSITION_TEMPLATES) {
         _templates.push_back(img.clone());
     }
     return EnrollmentSampleResult::accepted;
@@ -90,8 +91,8 @@ bool Fingerprint::match(
         }
     }
 
-    // Old databases contain only the stitched template. New databases keep it
-    // for rollback compatibility, but do not use its lower legacy threshold:
+    // Old databases contain only the stitched template. New databases keep a
+    // first-scan print/mask for storage compatibility, but do not use its lower legacy threshold:
     // trying both paths would multiply false-accept opportunities and defeat
     // the stricter per-position matcher.
     if (_templates.empty()) {

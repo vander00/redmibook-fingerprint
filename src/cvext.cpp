@@ -26,7 +26,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 namespace cvext {
 
-bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter);
+bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter, double min_overlap_ratio, double* overlap_ratio);
 bool merge_impl(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, cv::Mat& output, cv::Mat& output_mask);
 
 // Reject homographies that are geometrically implausible for a finger press on
@@ -307,7 +307,7 @@ cv::Scalar MSSIM(cv::Mat& img1, cv::Mat& img2, cv::InputArray mask)
     return cv::mean(ssim_map, mask);
 }
 
-bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter)
+bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter, double min_overlap_ratio, double* overlap_ratio)
 {
     if (fingerprint.empty() or fp_mask.empty() or partial.empty()) {
         return false;
@@ -338,7 +338,9 @@ bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Ma
     // luck - which is both a false-accept risk and a source of flaky results.
     // Demand a real overlap before trusting the score.
     const int overlap_px = cv::countNonZero(valid);
-    const int min_overlap_px = static_cast<int>(partial.total() / 4);
+    const int min_overlap_px = overlap_ratio == nullptr
+        ? static_cast<int>(partial.total() / 4)
+        : static_cast<int>(std::ceil(partial.total() * min_overlap_ratio));
     if (overlap_px < min_overlap_px) {
         return false;
     }
@@ -366,7 +368,13 @@ bool match_impl(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Ma
               << "/" << partial.total()
               << std::endl;
 
-    return score[0] >= min_score;
+    if (score[0] < min_score) {
+        return false;
+    }
+    if (overlap_ratio != nullptr) {
+        *overlap_ratio = static_cast<double>(overlap_px) / partial.total();
+    }
+    return true;
 }
 
 bool merge_impl(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, cv::Mat& output, cv::Mat& output_mask)
@@ -493,12 +501,44 @@ bool merge_impl(const cv::Mat& img1, const cv::Mat& mask1, const cv::Mat& img2, 
 bool match(const cv::Mat& fingerprint, const cv::Mat& fp_mask, const cv::Mat& partial, int min_match, double min_score, bool filter)
 {
     try {
-        return match_impl(fingerprint, fp_mask, partial, min_match, min_score, filter);
+        return match_impl(fingerprint, fp_mask, partial, min_match, min_score, filter, 0.25, nullptr);
     } catch (const cv::Exception& exc) {
         std::cerr << "match: opencv error: " << exc.what() << std::endl;
         return false;
     } catch (const std::exception& exc) {
         std::cerr << "match: error: " << exc.what() << std::endl;
+        return false;
+    }
+}
+
+bool enrollment_match(const cv::Mat& fingerprint, const cv::Mat& partial, double& overlap_ratio)
+{
+    try {
+        if (fingerprint.empty() or partial.empty()) {
+            return false;
+        }
+        cv::Mat mask{fingerprint.size(), CV_32F, cv::Scalar{1.0F}};
+        return match_impl(fingerprint, mask, partial, 6, 0.4, false, 0.15, &overlap_ratio);
+    } catch (const cv::Exception& exc) {
+        std::cerr << "enrollment match: opencv error: " << exc.what() << std::endl;
+        return false;
+    } catch (const std::exception& exc) {
+        std::cerr << "enrollment match: error: " << exc.what() << std::endl;
+        return false;
+    }
+}
+
+bool has_enrollment_features(const cv::Mat& image)
+{
+    if (image.empty() or image.type() != CV_8UC1) {
+        return false;
+    }
+    try {
+        std::vector<cv::KeyPoint> keypoints{};
+        cv::SIFT::create()->detect(image, keypoints);
+        return keypoints.size() >= 6;
+    } catch (const cv::Exception& exc) {
+        std::cerr << "enrollment features: opencv error: " << exc.what() << std::endl;
         return false;
     }
 }

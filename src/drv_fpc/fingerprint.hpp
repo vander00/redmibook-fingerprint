@@ -28,6 +28,8 @@ namespace fpc {
 // The first five frames build distinct-area coverage. The remaining frames
 // add alignable angle, pressure, and nearby-placement variations.
 static constexpr size_t DISTINCT_AREA_POSITION_TEMPLATES = 5;
+static constexpr size_t ENROLLMENT_POSITION_TEMPLATES = 7;
+// Older records can contain ten templates; keep reading and matching all of them.
 static constexpr size_t MAX_POSITION_TEMPLATES = 10;
 static constexpr double MIN_NEW_POSITION_AREA_RATIO = 0.10;
 

@@ -75,11 +75,45 @@ cv::Mat reposition(const cv::Mat& image, double angle, double x, double y)
     return output;
 }
 
+cv::Mat make_wide_pattern()
+{
+    cv::Mat image{cv::Size{500, 176}, CV_8UC1, cv::Scalar{24}};
+    cv::RNG rng{0x9261};
+    for (int idx = 0; idx < 250; ++idx) {
+        const cv::Point center{rng.uniform(0, image.cols), rng.uniform(0, image.rows)};
+        cv::ellipse(image, center, cv::Size{rng.uniform(5, 25), rng.uniform(2, 9)},
+                    rng.uniform(-25.0, 25.0), 0, 300,
+                    cv::Scalar{static_cast<double>(rng.uniform(100, 240))},
+                    2, cv::LINE_AA);
+    }
+    return image;
+}
+
 } // namespace
 
 int main()
 {
+    const auto wide = make_wide_pattern();
+    fpc::Fingerprint gradual{};
+    for (int step = 0; step < static_cast<int>(fpc::ENROLLMENT_POSITION_TEMPLATES); ++step) {
+        const cv::Mat position = wide(cv::Rect{step * 25, 0, 224, 176});
+        require(gradual.merge(position) == fpc::EnrollmentSampleResult::accepted,
+                "gradual position failed to enroll");
+        require(gradual.template_count() == static_cast<size_t>(step + 1),
+                "gradual position did not advance enrollment");
+    }
+    for (int step = 0; step < static_cast<int>(fpc::ENROLLMENT_POSITION_TEMPLATES); ++step) {
+        require(gradual.match(wide(cv::Rect{step * 25, 0, 224, 176}),
+                              0.30F, 0.40F, false),
+                "gradual position did not verify");
+    }
+
     const auto enrolled = make_pattern(0x9201);
+    fpc::Fingerprint no_features{};
+    require(no_features.merge(cv::Mat{enrolled.size(), CV_8UC1, cv::Scalar{24}}) ==
+                fpc::EnrollmentSampleResult::unmatchable,
+            "featureless first scan advanced enrollment");
+    require(no_features.template_count() == 0, "featureless first scan was saved");
     const auto right = reposition(enrolled, 1.0, 30.0, 0.0);
     const auto left = reposition(enrolled, -1.0, -30.0, 0.0);
     const auto down = reposition(enrolled, 1.0, 0.0, 28.0);
@@ -102,7 +136,7 @@ int main()
     require(fingerprint.merge(enrolled) == fpc::EnrollmentSampleResult::insufficient_new_area,
             "duplicate enrollment position accepted");
     require(fingerprint.template_count() == 1, "duplicate position advanced enrollment");
-    require(fingerprint.total() == first_area, "duplicate position changed stitched coverage");
+    require(fingerprint.total() == first_area, "duplicate position changed stored print");
     require(fingerprint.merge(right) == fpc::EnrollmentSampleResult::accepted,
             "right enrollment position rejected");
     require(fingerprint.merge(left) == fpc::EnrollmentSampleResult::accepted,
@@ -120,14 +154,8 @@ int main()
             "duplicate variation rejected after coverage phase");
     require(fingerprint.merge(nearby_right) == fpc::EnrollmentSampleResult::accepted,
             "nearby right variation rejected");
-    require(fingerprint.merge(nearby_left) == fpc::EnrollmentSampleResult::accepted,
-            "nearby left variation rejected");
-    require(fingerprint.merge(angled) == fpc::EnrollmentSampleResult::accepted,
-            "angled variation rejected");
-    require(fingerprint.merge(lighter) == fpc::EnrollmentSampleResult::accepted,
-            "pressure variation rejected");
-    require(fingerprint.template_count() == fpc::MAX_POSITION_TEMPLATES,
-            "ten position templates not retained");
+    require(fingerprint.template_count() == fpc::ENROLLMENT_POSITION_TEMPLATES,
+            "seven position templates not retained");
     require(fingerprint.match(enrolled, 0.30F, 0.40F, false), "center position did not match");
     require(fingerprint.match(right, 0.30F, 0.40F, false), "right position did not match");
     require(fingerprint.match(left, 0.30F, 0.40F, false), "left position did not match");
@@ -144,10 +172,10 @@ int main()
     const auto completed_area = fingerprint.total();
     require(fingerprint.merge(other) == fpc::EnrollmentSampleResult::unmatchable,
             "unrelated sample accepted after coverage phase");
-    require(fingerprint.template_count() == fpc::MAX_POSITION_TEMPLATES,
+    require(fingerprint.template_count() == fpc::ENROLLMENT_POSITION_TEMPLATES,
             "failed post-coverage sample changed template count");
     require(fingerprint.total() == completed_area,
-            "failed post-coverage sample changed stitched coverage");
+            "failed post-coverage sample changed stored print");
 
     fpc::Fingerprint rejected{};
     require(rejected.merge(enrolled) == fpc::EnrollmentSampleResult::accepted,
@@ -155,8 +183,11 @@ int main()
     const auto accepted_area = rejected.total();
     require(rejected.merge(other) == fpc::EnrollmentSampleResult::unmatchable,
             "unrelated enrollment sample was accepted");
+    const cv::Mat featureless{enrolled.size(), CV_8UC1, cv::Scalar{24}};
+    require(rejected.merge(featureless) == fpc::EnrollmentSampleResult::unmatchable,
+            "featureless enrollment sample was accepted");
     require(rejected.template_count() == 1, "unmatchable sample advanced enrollment");
-    require(rejected.total() == accepted_area, "unmatchable sample changed stitched coverage");
+    require(rejected.total() == accepted_area, "unmatchable sample changed stored print");
 
     cv::FileStorage writer{
         "memory", cv::FileStorage::WRITE | cv::FileStorage::MEMORY |
@@ -169,10 +200,30 @@ int main()
                         cv::FileStorage::FORMAT_JSON};
     fpc::Fingerprint restored{};
     restored.read(reader, 0);
-    require(restored.template_count() == fpc::MAX_POSITION_TEMPLATES,
+    require(restored.template_count() == fpc::ENROLLMENT_POSITION_TEMPLATES,
             "position templates lost on reload");
     require(restored.match(nearby_right, 0.30F, 0.40F, false),
             "reloaded template did not match");
+
+    // The previous release saved ten position templates. Loading must not
+    // truncate its last three positions when new enrollments use seven.
+    fpc::Fingerprint ten_template_record = fingerprint;
+    ten_template_record._templates.push_back(nearby_left.clone());
+    ten_template_record._templates.push_back(angled.clone());
+    ten_template_record._templates.push_back(lighter.clone());
+    cv::FileStorage ten_writer{
+        "memory", cv::FileStorage::WRITE | cv::FileStorage::MEMORY |
+                      cv::FileStorage::FORMAT_JSON};
+    ten_template_record.write(ten_writer, 0);
+    cv::FileStorage ten_reader{
+        ten_writer.releaseAndGetString(), cv::FileStorage::READ | cv::FileStorage::MEMORY |
+                                          cv::FileStorage::FORMAT_JSON};
+    fpc::Fingerprint ten_restored{};
+    ten_restored.read(ten_reader, 0);
+    require(ten_restored.template_count() == fpc::MAX_POSITION_TEMPLATES,
+            "older ten-template record was truncated");
+    require(ten_restored.match(lighter, 0.30F, 0.40F, false),
+            "older ten-template record stopped matching");
 
     // Records written by the previous five-position release remain readable.
     fpc::Fingerprint five_template_record{};
@@ -221,6 +272,6 @@ int main()
     require(legacy.match(nearby_right, 0.30F, 0.40F, false),
             "legacy template stopped matching");
 
-    std::cout << "PASS: ten-template matching and compatible storage" << std::endl;
+    std::cout << "PASS: seven-scan enrollment and compatible storage" << std::endl;
     return 0;
 }
