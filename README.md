@@ -28,7 +28,7 @@ cd redmibook-fingerprint
 ```
 
 
-After installation, enroll a fingerprint:
+After installation, enroll a fingerprint. The enrollment takes 10 steps. **Place the finger in nearly the same position as it was the previous step.**
 
 ```bash
 fprintd-enroll
