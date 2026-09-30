@@ -3,9 +3,11 @@
 srpm:
 	dnf -y install git rpm-build tar gzip
 	@set -eu; \
+	spec_file="$(spec)"; \
+	if [ -z "$$spec_file" ] || [ -d "$$spec_file" ]; then spec_file=fingerprint-ocv.spec; fi; \
 	git submodule update --init --recursive -- asyncdbus asyncusb jinx; \
-	name=$$(rpmspec -q --srpm --qf '%{NAME}' "$(spec)"); \
-	version=$$(rpmspec -q --srpm --qf '%{VERSION}' "$(spec)"); \
+	name=$$(rpmspec -q --srpm --qf '%{NAME}' "$$spec_file"); \
+	version=$$(rpmspec -q --srpm --qf '%{VERSION}' "$$spec_file"); \
 	workdir=$$(mktemp -d); \
 	trap 'rm -rf "$$workdir"' EXIT; \
 	mkdir -p "$$workdir/$$name-$$version" "$$workdir/rpmbuild" "$(outdir)"; \
@@ -19,4 +21,4 @@ srpm:
 	    --define "_topdir $$workdir/rpmbuild" \
 	    --define "_sourcedir $$workdir" \
 	    --define "_srcrpmdir $(outdir)" \
-	    "$(spec)"
+	    "$$spec_file"
