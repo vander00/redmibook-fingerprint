@@ -1,12 +1,5 @@
 cmake_minimum_required(VERSION 3.13)
 
-option(FINGERPRINT_OCV_USE_VCPKG "Use the bundled vcpkg toolchain" ON)
-
-if(FINGERPRINT_OCV_USE_VCPKG)
-    set(CMAKE_TOOLCHAIN_FILE ${CMAKE_CURRENT_SOURCE_DIR}/vcpkg/scripts/buildsystems/vcpkg.cmake)
-    set(LIBEVENT_FIND_PACKAGE ON)
-endif()
-
 project(fingerprint-ocv)
 
 include(CTest)

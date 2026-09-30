@@ -69,8 +69,7 @@ cmake -S . -B build \
   -DCMAKE_C_COMPILER=gcc \
   -DCMAKE_CXX_COMPILER=g++ \
   -DCMAKE_BUILD_TYPE=Release \
-  -DBUILD_TESTING=OFF \
-  -DFINGERPRINT_OCV_USE_VCPKG=OFF
+  -DBUILD_TESTING=OFF
 cmake --build build --parallel
 sudo cmake --install build --prefix /usr/local
 ```
