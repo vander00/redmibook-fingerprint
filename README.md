@@ -28,6 +28,14 @@ cd redmibook-fingerprint
 ./install.sh
 ```
 
+## fedora copr package
+
+```bash
+sudo dnf copr enable OWNER/PROJECT
+sudo dnf install fingerprint-ocv
+sudo systemctl restart fprintd.service
+```
+
 After installation, enroll a fingerprint. The enrollment takes 7 steps. **Each step requires the finger would 15% the same position as for the previous step.**
 
 ```bash
@@ -75,6 +83,8 @@ sudo cmake --install build --prefix /usr/local
 ```
 
 ## Uninstall
+
+For an installation made with `install.sh`:
 
 ```bash
 sudo rm /etc/systemd/system/fprintd.service.d/20-fingerprint-ocv.conf
