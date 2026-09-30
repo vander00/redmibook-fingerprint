@@ -2,9 +2,6 @@
 
 Linux fingerprint driver for the FPC Sensor Controller `10a5:9201`, tested on the RedmiBook Pro 15 2023.
 
-For a detailed walkthrough of the sensor protocol, image processing, matching,
-and D-Bus integration, open [the developer guide](sensor-guide.html) in a browser.
-
 > [WARNING]
 > This driver is rewritten mostly by AI so the code might be not the best.
 
