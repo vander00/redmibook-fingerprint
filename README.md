@@ -2,6 +2,9 @@
 
 Linux fingerprint driver for the FPC Sensor Controller `10a5:9201`, tested on the RedmiBook Pro 15 2023.
 
+For a detailed walkthrough of the sensor protocol, image processing, matching,
+and D-Bus integration, open [the developer guide](sensor-guide.html) in a browser.
+
 > [WARNING]
 > This driver is rewritten mostly by AI so the code might be not the best.
 
@@ -17,6 +20,7 @@ lsusb -d 10a5:9201
 Other devices are not supported by this driver.
 
 ## Install
+
 The installer only works for systemd systems.
 It downloads the latest binary from the releases.
 It can also build from source for Arch, Debian/Ubuntu, Fedora linux systems.
@@ -27,8 +31,7 @@ cd redmibook-fingerprint
 ./install.sh
 ```
 
-
-After installation, enroll a fingerprint:
+After installation, enroll a fingerprint. The enrollment takes 7 steps. **Each step requires the finger would 15% the same position as for the previous step.**
 
 ```bash
 fprintd-enroll
