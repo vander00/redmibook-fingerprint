@@ -100,7 +100,7 @@ install_dependencies() {
         *" debian "*|*" ubuntu "*)
             packages=(
                 usbutils libusb-1.0-0-dev libevent-dev libdbus-1-dev
-                libssl-dev libopencv-dev fprintd
+                libssl-dev fprintd
             )
             if [[ "${install_build_tools}" == true ]]; then
                 packages+=(build-essential cmake pkg-config git)
@@ -110,7 +110,7 @@ install_dependencies() {
             run_as_root apt-get install -y --no-install-recommends "${packages[@]}"
             ;;
         *" arch "*)
-            packages=(usbutils libusb libevent dbus openssl opencv fprintd)
+            packages=(usbutils libusb libevent dbus openssl fprintd)
             if [[ "${install_build_tools}" == true ]]; then
                 packages+=(base-devel cmake pkgconf git)
             fi
@@ -120,7 +120,7 @@ install_dependencies() {
         *" fedora "*|*" rhel "*)
             packages=(
                 usbutils libusb1-devel libevent-devel dbus-devel
-                openssl-devel opencv-devel fprintd
+                openssl-devel fprintd
             )
             if [[ "${install_build_tools}" == true ]]; then
                 packages+=(gcc-c++ make cmake pkgconf-pkg-config git)

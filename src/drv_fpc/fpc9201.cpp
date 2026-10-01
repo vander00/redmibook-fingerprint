@@ -1,3 +1,4 @@
+#include "tls_key.hpp"
 /*
 Copyright (C) 2022  pom@vro.life
 
@@ -44,10 +45,6 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <openssl/hmac.h>
 #include <openssl/aes.h>
 
-#ifdef USE_HIGHGUI
-#include <opencv2/highgui.hpp>
-#endif
-
 #include <jinx/async.hpp>
 #include <jinx/logging.hpp>
 #include <jinx/macros.hpp>
@@ -61,6 +58,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include "fpc9201.hpp"
 #include "manager.hpp"
 #include "fingerprint.hpp"
+#include "protocol.hpp"
+#include "usb_transfer.hpp"
 
 #define CTRL_HOST_TO_DEVICE 0x40
 #define CTRL_DEVICE_TO_HOST 0xC0
@@ -91,36 +90,52 @@ struct FPCEvent
         FPP_FingerDown,
         FPP_Image,
         FPP_EnrollVerifyStop,
-        FPP_TransportFailed
+        FPP_TransportFailed,
+        FPP_Suspend,
+        FPP_Resume
     } _type;
     struct fpc_event _ev;
     std::vector<FPCBuffer> _buffers{};
     error::Error _error{};
+    uint64_t _generation{};
 };
 
-static void start(fingerpp::Manager* manager, fingerpp::USBDeviceInfo* info, USBDeviceHandle&& handle);
-
-static
-cv::Mat load_data_and_proc(const std::vector<unsigned char>& pixels)
-{
-    cv::Mat raw{cv::Size{112, 88}, CV_8UC1};
-    memcpy(raw.data, pixels.data(), pixels.size());
-
-    cv::Mat eqh{cv::Size{112, 88}, CV_8UC1};
-    cv::equalizeHist(raw, eqh);
-
-    cv::Mat gam{cv::Size(112, 88), CV_8UC1};
-    cvext::gamma<unsigned char>(eqh, gam, 1.5);
-
-    cv::Mat img{cv::Size(224, 176), CV_8UC1};
-    cv::resize(gam, img, {224, 176});
-    return img;
+static FPCEvent frame_event(fpc::WireEvent&& frame,BIOPipePtr& pipe) {
+    FPCEvent event{FPCEvent::FPC_Event,{frame.code,frame.length,frame.result},{}};
+    size_t offset=0;
+    while(offset<frame.body.size()){
+        auto buffer=pipe->_allocator.allocate(FPCBufferConfig{});if(!buffer)throw std::bad_alloc();
+        auto view=buffer->slice_for_producer();size_t size=std::min(view.size(),frame.body.size()-offset);
+        memcpy(view.data(),frame.body.data()+offset,size);buffer->commit(size).abort_on(Failed_,"buffer overflow");
+        event._buffers.push_back(std::move(buffer));offset+=size;
+    }
+    return event;
 }
+
+static void start(fingerpp::Manager* manager, fingerpp::USBDeviceInfo* info, USBDeviceHandle&& handle);
 
 struct DeviceState
 {
     bool _finger_present{};
     bool _finger_needed{};
+    DBusConnection* _connection{};
+    std::string _path;
+    void set(bool present,bool needed){
+        if(present==_finger_present && needed==_finger_needed)return;
+        _finger_present=present;_finger_needed=needed;
+        if(!_connection || _path.empty())return;
+        AsyncDBusMessage signal{dbus_message_new_signal(_path.c_str(),"org.freedesktop.DBus.Properties","PropertiesChanged")};
+        if(!signal)return;
+        DBusMessageIter args{},changed{},invalidated{};dbus_message_iter_init_append(signal,&args);
+        const char* interface="net.reactivated.Fprint.Device";dbus_message_iter_append_basic(&args,DBUS_TYPE_STRING,&interface);
+        dbus_message_iter_open_container(&args,DBUS_TYPE_ARRAY,"{sv}",&changed);
+        const char* names[2]={"finger-present","finger-needed"};dbus_bool_t values[2]={dbus_bool_t(present),dbus_bool_t(needed)};
+        for(unsigned i=0;i<2;++i){DBusMessageIter entry{},variant{};dbus_message_iter_open_container(&changed,DBUS_TYPE_DICT_ENTRY,nullptr,&entry);
+            dbus_message_iter_append_basic(&entry,DBUS_TYPE_STRING,&names[i]);dbus_message_iter_open_container(&entry,DBUS_TYPE_VARIANT,"b",&variant);
+            dbus_message_iter_append_basic(&variant,DBUS_TYPE_BOOLEAN,&values[i]);dbus_message_iter_close_container(&entry,&variant);dbus_message_iter_close_container(&changed,&entry);}
+        dbus_message_iter_close_container(&args,&changed);dbus_message_iter_open_container(&args,DBUS_TYPE_ARRAY,"s",&invalidated);dbus_message_iter_close_container(&args,&invalidated);
+        dbus_connection_send(_connection,signal,nullptr);
+    }
 };
 
 // class WorkerUI : public DBusObject
@@ -147,6 +162,8 @@ class WorkerEnrollVerify : public AsyncRoutine {
     Queue<std::queue<FPCEvent>>* _image_queue{};
 
     Fingerprint _fingerprint{};
+    std::unique_ptr<fpc_native_enrollment, decltype(&fpc_native_enrollment_destroy)> _enrollment{nullptr,fpc_native_enrollment_destroy};
+    uint64_t _generation{};
     std::string _dbus_path{};
 
     FingerprintStorage* _storage{};
@@ -177,13 +194,15 @@ public:
         _image_queue = image_queue;
         _fingerprint._user = user;
         _fingerprint._name = name;
-        _fingerprint._fingerprint.release();
-        _fingerprint._mask.release();
+        _enrollment.reset();
         _dbus_path = dbus_path;
         _storage = storage;
 
         _verify = verify;
         _stage = 0;
+        _generation = ++_storage->capture_generation;
+        _storage->operation_active=true;
+        if (!_verify) _enrollment.reset(fpc_native_enrollment_create());
 
         syslog(LOG_AUTH | LOG_INFO, "%s start: %s/%s", _verify ? "verify" : "enroll", user.c_str(), name.c_str());
 
@@ -196,8 +215,10 @@ protected:
         _get_image.reset();
         _put_event.reset();
         _fingerprint._name.clear();
-        _fingerprint._fingerprint.release();
-        _fingerprint._mask.release();
+        _enrollment.reset();
+        if(_storage && _generation==_storage->capture_generation)++_storage->capture_generation;
+        if(_storage)_storage->operation_active=false;
+        if(_device_state)_device_state->set(false,false);
         AsyncRoutine::async_finalize();
     }
 
@@ -217,8 +238,7 @@ protected:
     }
 
     Async enroll() {
-        _device_state->_finger_needed = true;
-        _device_state->_finger_present = false;
+        _device_state->set(false,true);
         _image_queue->reset();
         return *this / _put_event(_event_queue, FPCEvent{FPCEvent::FPP_StartSensor, {}, {}}) / &WorkerEnrollVerify::wait_image;
     }
@@ -229,119 +249,74 @@ protected:
 
     Async parse_image() { // NOLINT
         auto& event = _get_image.get_result();
+        if((event._type==FPCEvent::FPP_Image || event._type==FPCEvent::FPP_FingerDown) && event._generation!=_generation)return wait_image();
         if (event._type == FPCEvent::FPP_FingerDown) {
-            _device_state->_finger_present = true;
+            _device_state->set(true,true);
             
         } else if (event._type == FPCEvent::FPP_Image) {
             // The image has been captured, so the finger is no longer being
             // read. The hardware gives us no FingerUp event, so _finger_present
             // would otherwise latch true forever after the first press and the
             // D-Bus property would always report a finger on the sensor.
-            _device_state->_finger_present = false;
-            std::vector<unsigned char> pixels{};
-            pixels.reserve(10000);
-            size_t skip = 12;
-
+            _device_state->set(false,true);
+            if (event._generation != _generation) return wait_image();
+            std::vector<unsigned char> payload;
             for (auto& buf : event._buffers) {
-                auto size = std::min(buf->size(), skip);
-                if (size > 0) {
-                    buf->consume(size).abort_on(Failed_, "buffer overflow");
-                    skip -= size;
+                auto bytes=buf->slice_for_consumer();
+                if(bytes.size()>12+2*FPC_PIXELS-payload.size())
+                    return send_signal(_verify?"verify-unknown-error":"enroll-unknown-error",TRUE);
+                const auto* data=static_cast<const unsigned char*>(bytes.data());
+                payload.insert(payload.end(),data,data+bytes.size());
+            }
+            if(payload.size()!=12+FPC_PIXELS && payload.size()!=12+2*FPC_PIXELS) {
+                jinx_log_error()<<"invalid capture bytes="<<payload.size()<<std::endl;
+                return send_signal(_verify?"verify-unknown-error":"enroll-unknown-error",TRUE);
+            }
+            // Windows ignores the three diagnostic words. The prefix changes
+            // across reader sessions; it is not a fixed profile identifier.
+            auto metadata=fpc::capture_header(payload.data(),payload.size());
+            (void)metadata;
+            try {
+                const uint8_t* frames[2]={payload.data()+12,payload.data()+12};
+                if(payload.size()==12+2*FPC_PIXELS)frames[1]+=FPC_PIXELS;
+                unsigned order[5];if(fpc_profile300_rank_frames(frames,2,order)){
+                    jinx_log_error()<<"native frame ranking failed"<<std::endl;
+                    return send_signal(_verify?"verify-unknown-error":"enroll-unknown-error",TRUE);
                 }
-
-                auto iobuf = buf->slice_for_consumer();
-                if (iobuf.size() == 0) {
-                    continue;
+                fpc_prepared_capture prepared{};
+                int preparation_status=fpc_profile300_prepare(frames[order[0]],FPC_PIXELS,_storage->dead_pixels.data(),
+                    _storage->dead_pixels.size(),&prepared);
+                if(preparation_status){
+                    jinx_log_error()<<"native preparation status="<<preparation_status<<" defects="<<_storage->dead_pixels.size()<<std::endl;
+                    return send_signal(_verify?"verify-unknown-error":"enroll-unknown-error",TRUE);
                 }
-                
-                size = pixels.size();
-                pixels.resize(size + iobuf.size());
-                memcpy(pixels.data() + size, iobuf.data(), iobuf.size());
-                buf->consume(iobuf.size()).abort_on(Failed_, "buffer overflow");
-            }
-
-            assert(pixels.size() == (SENSOR_WIDTH * SENSOR_HEIGHT));
-
-            cv::Mat partial = load_data_and_proc(pixels);
-
-#ifdef USE_HIGHGUI
-            bool debug = GET_OPTION(bool, "debug");
-
-            if (debug and not _fingerprint._fingerprint.empty()) {
-                cv::imshow("fingerprint", _fingerprint._fingerprint);
-                cv::imshow("mask", _fingerprint._mask);
-            }
-
-            if (debug) {
-                cv::imshow("partial", partial);
-            }
-
-            if (debug) {
-                cv::waitKey(50);
-            }
-#endif
-            if (_verify) {
-                bool ret = false;
-                Fingerprint* matched = nullptr;
-                size_t matched_template = std::numeric_limits<size_t>::max();
-                _storage->foreach(_fingerprint._user, [&](auto& fingerprint){
-                    if (not Fingerprint::is_any(_fingerprint._name) and _fingerprint._name != fingerprint._name) {
-                        return false;
-                    }
-                    ret = fingerprint.match(
-                        partial,
-                        GET_OPTION(float, "min-score"),
-                        GET_OPTION(float, "position-min-score"),
-                        GET_OPTION(bool, "filter-before-ssim"),
-                        &matched_template);
-                    if (ret) {
-                        matched = &fingerprint;
-                    }
-                    return ret; // return 'true' to break loop
-                });
-
-                std::cout << "verify " << ret << std::endl;
-
-                if (ret) {
-                    bool unique_anchor = true;
-                    if (Fingerprint::is_any(_fingerprint._name)) {
-                        unique_anchor = _storage->unique_strong_anchor(
-                            _fingerprint._user, partial) == matched;
-                    }
-                    matched->record_verification_use(matched_template);
-                    _storage->update_after_verification(*matched, partial, unique_anchor);
-                    return send_signal("verify-match", TRUE);
+                if(_verify) {
+                    bool match=_storage->verify(_fingerprint._user,_fingerprint._name,prepared);
+                    return send_signal(match?"verify-match":"verify-retry-scan",match?TRUE:FALSE);
                 }
-
-                return send_signal("verify-retry-scan", FALSE);
-
+                if(!_enrollment)return send_signal("enroll-unknown-error",TRUE);
+                fpc_native_enrollment_report report{};
+                int status=fpc_native_enrollment_add(_enrollment.get(),&prepared,&report);
+                if(status==112)return send_signal("enroll-failed",TRUE);
+                if(status){jinx_log_error()<<"native enrollment status="<<status<<std::endl;return send_signal("enroll-unknown-error",TRUE);}
+                if(report.rejection_flags)return send_signal("enroll-remove-and-retry",FALSE);
+                _stage=static_cast<int>(report.accepted);
+                if(!report.progress.complete)return send_signal("enroll-stage-passed",FALSE);
+                fpc_loaded_template completed{};
+                if(fpc_native_enrollment_finish(_enrollment.get(),&completed))
+                    return send_signal("enroll-unknown-error",TRUE);
+                try {_fingerprint._native=serialize_native_template(completed);}
+                catch(...){fpc_loaded_template_destroy(&completed);throw;}
+                fpc_loaded_template_destroy(&completed);
+                if(!_storage->insert_or_update(std::move(_fingerprint)))return send_signal("enroll-failed",TRUE);
+                return send_signal("enroll-completed",TRUE);
+            }catch(const std::exception& error){
+                jinx_log_error()<<"native scan failed: "<<error.what()<<std::endl;
+                return send_signal(_verify?"verify-unknown-error":"enroll-unknown-error",TRUE);
             }
-            auto ret = _fingerprint.merge(partial);
-
-            if (ret != EnrollmentSampleResult::accepted) {
-                if (ret == EnrollmentSampleResult::insufficient_new_area) {
-                    std::cout << "enroll: position adds too little new area (reposition finger)" << std::endl;
-                } else {
-                    std::cout << "enroll: no credible overlap with a saved scan (move back slightly and retry)" << std::endl;
-                }
-                return send_signal("enroll-remove-and-retry", FALSE);
-            }
-            
-            auto template_count = _fingerprint.template_count();
-            std::cout << "enroll: templates=" << template_count
-                      << "/" << ENROLLMENT_POSITION_TEMPLATES
-                      << std::endl;
-
-            if (template_count < ENROLLMENT_POSITION_TEMPLATES) {
-                _stage = static_cast<int>(template_count);
-                return send_signal("enroll-stage-passed", FALSE);
-            }
-            std::cout << "enroll: completed" << std::endl;
-            _storage->insert_or_update(std::move(_fingerprint));
-            _storage->save();
-            return send_signal("enroll-completed", TRUE);
 
         } else if (event._type == FPCEvent::FPP_EnrollVerifyStop) {
+            ++_storage->capture_generation;_device_state->set(false,false);
             return *this / _put_event(_event_queue, FPCEvent{FPCEvent::FPP_StopSensor, {}, {}}) / &WorkerEnrollVerify::async_return;
         } else if (event._type == FPCEvent::FPP_TransportFailed) {
             // A suspended USB device invalidates the active scan. Complete
@@ -356,6 +331,7 @@ protected:
     }
 
     Async send_signal(const char* status, dbus_bool_t async_return) {
+        syslog(LOG_INFO,"native operation result: %s terminal=%u",status,async_return);
         AsyncDBusMessage signal{
             dbus_message_new_signal(_dbus_path.c_str(), "net.reactivated.Fprint.Device", _verify ? "VerifyStatus" : "EnrollStatus")
         };
@@ -365,10 +341,17 @@ protected:
         dbus_message_iter_append_basic(&iter, DBUS_TYPE_BOOLEAN, &async_return);
         return *this 
             / _send_signal(_manager->get_dbus().get_connection(), signal) 
-            / ( async_return == TRUE ? &WorkerEnrollVerify::stop : &WorkerEnrollVerify::wait_image);
+            / ( async_return == TRUE ? &WorkerEnrollVerify::stop : &WorkerEnrollVerify::next_capture);
+    }
+
+    Async next_capture(){
+        _generation=++_storage->capture_generation;
+        return *this / _put_event(_event_queue,FPCEvent{FPCEvent::FPP_StartSensor,{},{}}) / &WorkerEnrollVerify::wait_image;
     }
 
     Async stop() {
+        ++_storage->capture_generation;
+        _device_state->set(false,false);
         return *this / _put_event(_event_queue, FPCEvent{FPCEvent::FPP_StopSensor, {}, {}}) / &WorkerEnrollVerify::async_return;
     }
 };
@@ -405,6 +388,7 @@ class WorkerListen : public AsyncRoutine, private jinx::Queue2<std::queue<AsyncD
     QueueType* _message_queue{};
 
     std::string _rule{};
+    bool _installed{};
 
     AsyncDBusMessage _pending_message{};
 
@@ -429,7 +413,12 @@ public:
     }
     
     void async_finalize() noexcept override {
-        dbus_connection_remove_filter(_connection, filter_signal, this);
+        dbus_connection_remove_filter(_connection,filter_signal,this);
+        if(_installed){
+            AsyncDBusMessage remove{dbus_message_new_method_call("org.freedesktop.DBus","/org/freedesktop/DBus","org.freedesktop.DBus","RemoveMatch")};
+            if(remove){DBusMessageIter args{};dbus_message_iter_init_append(remove,&args);const char* rule=_rule.c_str();dbus_message_iter_append_basic(&args,DBUS_TYPE_STRING,&rule);dbus_connection_send(_connection,remove,nullptr);}
+            _installed=false;
+        }
         AsyncRoutine::async_finalize();
     }
 
@@ -450,12 +439,14 @@ public:
             jinx_log_error() << "AddWatch(" << _rule << ") failed: " << dbus_message_get_error_name(reply) << std::endl;
             return async_throw(ErrorAsyncDBus::failed);
         }
+        _installed=true;
         dbus_connection_add_filter(_connection, filter_signal, this, nullptr);
         async_start(&WorkerListen::exit);
         return this->async_suspend();
     }
 
     Async exit() {
+        _installed=false;
         AsyncDBusMessage msg{
             dbus_message_new_method_call("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "RemoveMatch")
         };
@@ -478,9 +469,17 @@ public:
         if (dbus_message_get_type(msg) != DBUS_MESSAGE_TYPE_SIGNAL) {
             return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
         }
-        // TODO match rule
         auto* self = reinterpret_cast<WorkerListen*>(data);
-        self->async_resume() >> JINX_IGNORE_RESULT;
+        auto field=[&](const char* key){std::string prefix=std::string(key)+"='";auto begin=self->_rule.find(prefix);
+            if(begin==std::string::npos)return std::string{};begin+=prefix.size();auto end=self->_rule.find("'",begin);return self->_rule.substr(begin,end-begin);};
+        auto interface=field("interface"),member=field("member"),sender=field("sender"),path=field("path"),arg0=field("arg0");
+        if((!interface.empty() && !dbus_message_has_interface(msg,interface.c_str())) ||
+           (!member.empty() && !dbus_message_has_member(msg,member.c_str())) ||
+           (!path.empty() && !dbus_message_has_path(msg,path.c_str())))return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+        if(!arg0.empty()){DBusMessageIter args{};const char* value=nullptr;
+            if(!dbus_message_iter_init(msg,&args) || dbus_message_iter_get_arg_type(&args)!=DBUS_TYPE_STRING)return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+            dbus_message_iter_get_basic(&args,&value);if(!value || arg0!=value)return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;}
+
         
         self->_pending_message.reset(msg);
         self->_pending_message.ref();
@@ -489,6 +488,35 @@ public:
         }
         self->_pending_message.reset();
         return DBUS_HANDLER_RESULT_NEED_MEMORY;
+    }
+};
+
+// Kept alive while the USB session is torn down, so resume is still observable.
+class WorkerPower : public AsyncDBusObject {
+    TaskPtr _listener;
+    Queue<std::queue<FPCEvent>>* _events{};
+    FingerprintStorage* _storage{};
+    Queue<std::queue<FPCEvent>>::Put _put{};
+public:
+    WorkerPower& operator()(Loop* loop,AsyncDBusConnection& connection,Queue<std::queue<FPCEvent>>* events,FingerprintStorage* storage){
+        _events=events;_storage=storage;
+        add_node("/net/reactivated/Fprint/Power", [](AsyncDBusNode&) {});
+        add_method("org.freedesktop.login1.Manager","PrepareForSleep","b",&WorkerPower::power_changed);
+        AsyncDBusObject::operator()(connection);
+        _listener=loop->task_new<WorkerListen>(connection,get_message_queue(),
+            "type='signal',sender='org.freedesktop.login1',path='/org/freedesktop/login1',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'");
+        return *this;
+    }
+protected:
+    void async_finalize() noexcept override {
+        if(_listener){async_cancel(_listener)>>JINX_IGNORE_RESULT;_listener.reset();}
+        _put.reset();AsyncDBusObject::async_finalize();
+    }
+    Async power_changed(){
+        DBusMessageIter args{};dbus_bool_t sleeping=FALSE;
+        if(!dbus_message_iter_init(get_message(),&args) || dbus_message_iter_get_arg_type(&args)!=DBUS_TYPE_BOOLEAN)return run();
+        dbus_message_iter_get_basic(&args,&sleeping);_storage->sleeping=sleeping;if(sleeping)++_storage->capture_generation;
+        return *this / _put(_events,FPCEvent{sleeping?FPCEvent::FPP_Suspend:FPCEvent::FPP_Resume,{},{}}) / &WorkerPower::run;
     }
 };
 
@@ -727,6 +755,7 @@ public:
         _manager = manager;
         _storage = storage;
         _dbus_path = manager->register_device();
+        _device_state._connection=manager->get_dbus().get_connection();_device_state._path=_dbus_path;
 
         add_node(_dbus_path, [&](AsyncDBusNode& node){
             node.add_interface("net.reactivated.Fprint.Device", [&](AsyncDBusInterface& iface){
@@ -763,7 +792,7 @@ public:
         _scan_type = "press";
         _num_enroll_stages = static_cast<int>(ENROLLMENT_POSITION_TEMPLATES);
         _device_state._finger_present = false;
-        _device_state._finger_needed = true;
+        _device_state._finger_needed = false;
 
         // _enroll_task = manager->task_new<WorkerEnroll>(
         //     manager->get_dbus().get_connection(), 
@@ -1055,8 +1084,10 @@ protected:
         // get username
         auto* data = MessageData::get_data(msg);
 
-        _storage->delete_all(data->_username);
-        _storage->save();
+        if(!_storage->delete_all(data->_username)) {
+            AsyncDBusMessage reply{dbus_message_new_error(msg,"net.reactivated.Fprint.Error.Internal","database save failed")};
+            return *this / _send_message(_connection,reply) / &WorkerDevice::run;
+        }
         
         AsyncDBusMessage reply{
             dbus_message_new_method_return(msg)
@@ -1067,8 +1098,10 @@ protected:
     Async delete_enrolled_fingers2() {
         auto& msg = get_message();
 
-        _storage->delete_all(_claimed_user);
-        _storage->save();
+        if(!_storage->delete_all(_claimed_user)) {
+            AsyncDBusMessage reply{dbus_message_new_error(msg,"net.reactivated.Fprint.Error.Internal","database save failed")};
+            return *this / _send_message(_connection,reply) / &WorkerDevice::run;
+        }
         
         AsyncDBusMessage reply{
             dbus_message_new_method_return(msg)
@@ -1097,7 +1130,6 @@ protected:
             };
             return *this / _send_message(_connection, reply) / &WorkerDevice::run;
         }
-        _storage->save();
         
         AsyncDBusMessage reply{
             dbus_message_new_method_return(msg)
@@ -1196,7 +1228,7 @@ protected:
         }
 
         if (_enroll_verify_task != nullptr) {
-            _enroll_verify_task->resume({}) >> JINX_IGNORE_RESULT;
+            async_cancel(_enroll_verify_task) >> JINX_IGNORE_RESULT;
             _enroll_verify_task.reset();
         }
 
@@ -1217,6 +1249,10 @@ protected:
     Async enroll_verify_start() {
         const char* method = dbus_message_get_member(get_message());
         bool is_verify = strcmp(method, "VerifyStart") == 0;
+        if(!_storage->reader_ready || _storage->sleeping) {
+            AsyncDBusMessage reply{dbus_message_new_error(get_message(),"net.reactivated.Fprint.Error.Internal","reader session is recovering")};
+            return *this / _send_message(_connection,reply) / &WorkerDevice::run;
+        }
 
         if (_enroll_verify_task != nullptr) {
             AsyncDBusMessage reply{
@@ -1340,7 +1376,7 @@ protected:
         return *this / _put_image(_image_queue, FPCEvent{FPCEvent::FPP_EnrollVerifyStop, {}, {}}) / &WorkerDevice::run;
     }
 
-    // TODO signal PropertiesChanged
+    // Capture workers publish finger-present/finger-needed PropertiesChanged.
 
     Async handle_get_property() override {
         auto& msg = get_message();
@@ -1505,6 +1541,7 @@ protected:
 
 class TLSEventReader : public AsyncRoutine {
     BIOPipePtr _pipe{};
+    fpc::EventFramer _framer;
     Queue<std::queue<FPCEvent>>* _event_queue{nullptr};
 
     enum {
@@ -1573,54 +1610,14 @@ protected:
     }
 
     Async process() {
-        _received_length += _buffer->size();
-        _buffers.emplace_back(std::move(_buffer));
-
-        if (_mode == ModeInitial) {
-            auto& front = _buffers.front();
-            auto buf = front->slice_for_consumer();
-            if (buf._size < sizeof(fpc_event)) {
-                jinx_log_error() << "invalid data length\n";
-                return async_throw(make_error(LIBUSB_ERROR_IO));
-            }
-
-            const auto* event = reinterpret_cast<const fpc_event*>(buf.data());
-            _event_length = ntohl(event->len);
-            if (_event_length < sizeof(fpc_event)) {
-                jinx_log_error() << "invalid TLS event length\n";
-                return async_throw(make_error(LIBUSB_ERROR_IO));
-            }
-            _mode = ModeRecv;
-        }
-        
-        if (_mode == ModeRecv) {
-            if (_received_length < _event_length) {
-                return read();
-            }
-        }
-
-        if (_received_length != _event_length) {
-            jinx_log_error() << "TLS event length mismatch\n";
-            return async_throw(make_error(LIBUSB_ERROR_IO));
-        }
-        _received_length = 0;
-        _mode = ModeInitial;
-        {
-            auto& front = _buffers.front();
-            auto buf = front->slice_for_consumer();
-            front->consume(sizeof(fpc_event)).abort_on(Failed_, "buffer overflow");
-            if (buf._size < sizeof(fpc_event)) {
-                return async_throw(make_error(LIBUSB_ERROR_IO));
-            }
-            auto event = *reinterpret_cast<const fpc_event*>(buf.data());
-            event.code = ntohl(event.code);
-            event.len = ntohl(event.len);
-            auto buffers = std::move(_buffers);
-            _buffers.clear();
-            return *this 
-                / _put_event(_event_queue, FPCEvent{FPCEvent::FPC_Event, event, std::move(buffers)}) 
-                / &TLSEventReader::read;
-        }
+        try{auto view=_buffer->slice_for_consumer();_framer.feed(view.data(),view.size());_buffer.reset();}
+        catch(const std::exception&){return async_throw(make_error(LIBUSB_ERROR_IO));}
+        return dispatch_frames();
+    }
+    Async dispatch_frames(){
+        try{auto frame=_framer.next();if(!frame)return read();
+            return *this / _put_event(_event_queue,frame_event(std::move(*frame),_pipe)) / &TLSEventReader::dispatch_frames;
+        }catch(const std::exception&){return async_throw(make_error(LIBUSB_ERROR_IO));}
     }
 };
 
@@ -1630,6 +1627,7 @@ class USBInput : public AsyncRoutine {
     libusb_endpoint_descriptor _endpoint{};
     libusb_transfer* _transfer{};
     BIOPipePtr _pipe;
+    fpc::EventFramer _framer;
     Queue<std::queue<FPCEvent>>* _event_queue{nullptr};
 
     enum {
@@ -1642,7 +1640,7 @@ class USBInput : public AsyncRoutine {
     std::vector<FPCBuffer> _buffers;
     size_t _buffer_index{};
 
-    jinx::usb::USBBulkTransfer _bulk_transfer{};
+    fpcusb::USBBulkTransfer _bulk_transfer{};
     Queue<std::queue<FPCEvent>>::Put _put_event{};
 
 public:
@@ -1728,68 +1726,24 @@ protected:
     }
 
     Async parse() {
-        auto ret = _bulk_transfer.get_result();
-        _received_length += ret;
-
-        {
-            auto& back = _buffers.back();
-            back->commit(ret).abort_on(Failed_, "buffer overflow");
-        }
-
-        if (_mode == ModeInitial) {
-            auto& front = _buffers.front();
-            auto buf = front->slice_for_consumer();
-            if (buf._size < sizeof(fpc_event)) {
-                return recv();
-            }
-
-            const auto* event = reinterpret_cast<const fpc_event*>(buf.data());
-            _event_length = ntohl(event->len);
-            if (_event_length < sizeof(fpc_event)) {
-                jinx_log_error() << "invalid USB event length\n";
-                return async_throw(make_error(LIBUSB_ERROR_IO));
-            }
-            _mode = ModeRecv;
-        }
-        
-        if (_mode == ModeRecv) {
-            if (_received_length < _event_length) {
-                return recv();
-            }
-        }
-
-        if (_received_length != _event_length) {
-            jinx_log_error() << "USB event length mismatch\n";
-            return async_throw(make_error(LIBUSB_ERROR_IO));
-        }
-        _received_length = 0;
-        _mode = ModeInitial;
-        {
-            auto& front = _buffers.front();
-            auto buf = front->slice_for_consumer();
-            front->consume(sizeof(fpc_event)).abort_on(Failed_, "buffer overflow");
-            if (buf._size < sizeof(fpc_event)) {
-                return async_throw(make_error(LIBUSB_ERROR_IO));
-            }
-            auto event = *reinterpret_cast<const fpc_event*>(buf.data());
-            event.code = ntohl(event.code);
-            event.len = ntohl(event.len);
-            if (event.code == ev_tls) {
-                _buffer_index = 0;
-                return handle_tls_data();
-            }
-            auto buffers = std::move(_buffers);
-            _buffers.clear();
-            return *this 
-                / _put_event(_event_queue, FPCEvent{FPCEvent::FPC_Event, event, std::move(buffers)}) 
-                / &USBInput::prepare;
-        }
+        auto length=_bulk_transfer.get_result();auto& buffer=_buffers.back();
+        buffer->commit(length).abort_on(Failed_,"buffer overflow");
+        try{auto view=buffer->slice_for_consumer();_framer.feed(view.data(),view.size());}
+        catch(const std::exception&){return async_throw(make_error(LIBUSB_ERROR_IO));}
+        _buffers.clear();return dispatch_frames();
+    }
+    Async dispatch_frames(){
+        try{auto frame=_framer.next();if(!frame)return prepare();
+            auto event=frame_event(std::move(*frame),_pipe);
+            if(event._ev.code==ev_tls){_buffers=std::move(event._buffers);_buffer_index=0;return handle_tls_data();}
+            return *this / _put_event(_event_queue,std::move(event)) / &USBInput::dispatch_frames;
+        }catch(const std::exception&){return async_throw(make_error(LIBUSB_ERROR_IO));}
     }
 
     Async handle_tls_data() {
         if (_buffer_index >= _buffers.size()) {
             _buffers.clear();
-            return prepare();
+            return dispatch_frames();
         }
         auto& buffer = _buffers.at(_buffer_index);
         ++ _buffer_index;
@@ -1807,7 +1761,7 @@ class USBOutput : public AsyncRoutine {
     HeapBuffer _buffer{};
     buffer::BufferView _payload{};
 
-    jinx::usb::USBControlTransfer _control_transfer{};
+    fpcusb::USBControlTransfer _control_transfer{};
     Queue<std::queue<FPCEvent>>::Put _put_event{};
 
 public:
@@ -1884,6 +1838,31 @@ protected:
     }
 };
 
+class SessionWatchdog : public AsyncRoutine {
+    bool* _ready{};
+    Queue<std::queue<FPCEvent>>* _events{};
+    async::Sleep _sleep;
+    Queue<std::queue<FPCEvent>>::Put _put;
+public:
+    SessionWatchdog& operator()(bool* ready,Queue<std::queue<FPCEvent>>* events){_ready=ready;_events=events;async_start(&SessionWatchdog::wait);return *this;}
+protected:
+    Async wait(){return *this / _sleep(std::chrono::seconds(15)) / &SessionWatchdog::expired;}
+    Async expired(){if(*_ready)return async_return();
+        return *this / _put(_events,FPCEvent{FPCEvent::FPP_TransportFailed,{},{},make_error(LIBUSB_ERROR_TIMEOUT)}) / &SessionWatchdog::async_return;}
+};
+
+class USBReaper : public AsyncRoutine {
+    async::Sleep _sleep;
+public:
+    USBReaper& operator()(){async_start(&USBReaper::reap);return *this;}
+protected:
+    Async reap(){
+        fpcusb::drain_usb_closes();
+        if(!fpcusb::has_deferred_usb_closes())return async_return();
+        return *this / _sleep(std::chrono::milliseconds(5)) / &USBReaper::reap;
+    }
+};
+
 class WorkerControl : public AsyncRoutine 
 {
     fingerpp::Manager* _manager{};
@@ -1896,19 +1875,27 @@ class WorkerControl : public AsyncRoutine
     BIOPipePtr _pipe;
     Queue<std::queue<FPCEvent>> _event_queue{0};
     Queue<std::queue<FPCEvent>> _image_queue{0};
-    unsigned char _control_buffer[LIBUSB_CONTROL_SETUP_SIZE + 1000];
+    unsigned char _control_buffer[LIBUSB_CONTROL_SETUP_SIZE + 1000]{};
     std::vector<TaskPtr> _tasks{};
     bool _ready{};
-    TaskPtr _device_task{};
+    bool _capture_active{};
+    uint64_t _capture_generation{};
+    uint32_t _arm_token=0x17112f10;
+    uint16_t _reader_identity{},_optional_format{};
+    std::string _firmware;
+    std::chrono::steady_clock::time_point _last_arm{},_last_image{};
+    TaskPtr _device_task{},_power_task{};
+    bool _suspended{};
     FingerprintStorage _storage{};
     std::string device_unique_id{};
 
     Queue<std::queue<FPCEvent>>::Get _get_event{};
     Queue<std::queue<FPCEvent>>::Put _put_image{};
-    jinx::usb::USBControlTransfer _control_transfer{};
+    fpcusb::USBControlTransfer _control_transfer{};
     async::Sleep _sleep{};
     size_t _recovery_attempt{};
     error::Error _recovery_error{};
+    std::chrono::steady_clock::time_point _recovery_started{};
 
 public:
     WorkerControl& operator ()(
@@ -1921,6 +1908,7 @@ public:
         _handle = std::move(handle);
         _ready = false;
         _device_info->_attached = true;
+        _power_task=_manager->get_loop().task_new<WorkerPower>(&_manager->get_loop(),_manager->get_dbus().get_connection(),&_event_queue,&_storage);
         if (_handle == nullptr) {
             async_start(&WorkerControl::schedule_recovery);
         } else {
@@ -1930,6 +1918,13 @@ public:
     }
 
 protected:
+    static std::vector<unsigned char> event_bytes(FPCEvent& event) {
+        std::vector<unsigned char> bytes;
+        for(auto& buffer:event._buffers){auto view=buffer->slice_for_consumer();
+            if(view.size()>20000-bytes.size())throw std::runtime_error("oversized FPC event");
+            auto* data=static_cast<const unsigned char*>(view.data());bytes.insert(bytes.end(),data,data+view.size());}
+        return bytes;
+    }
     static bool find_endpoint(libusb_device* dev, libusb_interface_descriptor* interface, libusb_endpoint_descriptor* endpoint) 
     {
         struct libusb_config_descriptor* config_desc;
@@ -1960,12 +1955,13 @@ protected:
         return found;
     }
 
-    void cleanup_device() noexcept {
+    void cleanup_device(bool remove_device=false) noexcept {
+        _storage.reader_ready=false;
         // Cancel all queue users before clearing queued values. Resetting a
         // Jinx queue first resumes its waiters while their operations are
         // still linked, which can make a later reused Get fail with
         // PendingGetError.
-        if (_device_task != nullptr) {
+        if (remove_device && _device_task != nullptr) {
             async_cancel(_device_task) >> JINX_IGNORE_RESULT;
             _device_task.reset();
         }
@@ -1983,18 +1979,20 @@ protected:
         std::fill(_tls_key.begin(), _tls_key.end(), 0);
         _tls_key.clear();
 
-        if (_handle != nullptr and _interface.bLength != 0) {
-            libusb_release_interface(_handle, _interface.bInterfaceNumber);
-        }
-        _handle.reset();
+        _control_transfer.release();
+        fpcusb::defer_usb_close(_handle.release(),_interface.bLength?_interface.bInterfaceNumber:-1);
+        if(fpcusb::has_deferred_usb_closes())_manager->get_loop().task_new<USBReaper>();
         _interface = {};
         _endpoint = {};
         _pipe.reset();
         _ready = false;
+        _capture_active=false;
+        ++_storage.capture_generation;
     }
 
     void async_finalize() noexcept override {
-        cleanup_device();
+        if(_power_task){async_cancel(_power_task)>>JINX_IGNORE_RESULT;_power_task.reset();}
+        cleanup_device(true);
         _device_info->_attached = false;
         AsyncRoutine::async_finalize();
     }
@@ -2013,6 +2011,7 @@ protected:
     }
 
     Async schedule_recovery() {
+        if(_recovery_attempt>=6){jinx_log_error()<<"fingerprint recovery exhausted";return async_return();}
         auto delay = recovery_delay();
         ++_recovery_attempt;
         jinx_log_warning() << "fingerprint sensor recovery attempt "
@@ -2024,31 +2023,36 @@ protected:
         jinx_log_warning() << "fingerprint sensor session failed: "
                            << error.message() << std::endl;
         cleanup_device();
+        _suspended=_storage.sleeping;
+        if(_suspended)return get_event();
         return schedule_recovery();
     }
 
     Async notify_operation_failed(const error::Error& error) {
+        _ready=false;_storage.reader_ready=false;
         _recovery_error = error;
-        if (_device_task == nullptr) {
+        if (_device_task == nullptr || !_storage.operation_active) {
             return begin_recovery(error);
         }
-
+        _recovery_started=std::chrono::steady_clock::now();
         return *this
             / _put_image(&_image_queue, FPCEvent{FPCEvent::FPP_TransportFailed, {}, {}, error})
             / &WorkerControl::yield_recovery;
     }
 
     Async yield_recovery() {
-        // Let WorkerEnrollVerify send its terminal VerifyStatus/EnrollStatus
-        // signal before cleanup cancels that task and the USB session.
-        return async_yield(&WorkerControl::resume_recovery);
+        return *this / _sleep(std::chrono::milliseconds(5)) / &WorkerControl::resume_recovery;
     }
-
     Async resume_recovery() {
+        if(_storage.operation_active && std::chrono::steady_clock::now()-_recovery_started<std::chrono::seconds(5))
+            return *this / _sleep(std::chrono::milliseconds(50)) / &WorkerControl::resume_recovery;
         return begin_recovery(_recovery_error);
     }
 
     Async reopen() {
+        fpcusb::drain_usb_closes();
+        if(fpcusb::has_deferred_usb_closes())
+            return *this / _sleep(std::chrono::milliseconds(5)) / &WorkerControl::reopen;
         USBDeviceHandle handle{
             libusb_open_device_with_vid_pid(
                 _manager->get_usb(),
@@ -2073,11 +2077,11 @@ protected:
 
         if (error.category() == category_awaitable()) {
             if (static_cast<ErrorAwaitable>(error.value()) == ErrorAwaitable::Cancelled) {
-                return begin_recovery(error);
+                return async_return();
             }
         } else if (error.category() == category_transfer()
                    or error.category() == category_usb()) {
-            return begin_recovery(error);
+            return notify_operation_failed(error);
         }
 
         return state;
@@ -2117,6 +2121,7 @@ protected:
     Async parse_state() {
         libusb_device_handle* handle = _handle.get();
         unsigned char* data = &_control_buffer[LIBUSB_CONTROL_SETUP_SIZE];
+        if(_control_transfer.get_result()!=72)return async_throw(make_error(LIBUSB_ERROR_IO));
 
         printf("Version %d.%d.%d.%d\n", 
             data[0], data[1], 
@@ -2141,6 +2146,7 @@ protected:
     }
 
     Async spawn() {
+        _tasks.emplace_back(task_new<SessionWatchdog>(&_ready,&_event_queue));
         _pipe = std::make_shared<BIOPipe>();
 
         _tasks.emplace_back(
@@ -2170,37 +2176,43 @@ protected:
                     break;
                 case ev_init_result:
                 {
-                    // discard init result
-
+                    auto bytes=event_bytes(event);
+                    if((bytes.size()!=24 && bytes.size()!=26) || event._ev.unknown!=0)
+                        return async_throw(make_error(LIBUSB_ERROR_IO));
+                    auto be16=[&](size_t offset){return uint16_t(uint16_t(bytes[offset])<<8|bytes[offset+1]);};
+                    _reader_identity=be16(0);_storage.hardware_id=be16(2);
+                    if(!_reader_identity || (_storage.hardware_id!=0x0111 && _storage.hardware_id!=0x0121) || be16(4)!=112 || be16(6)!=88)
+                        return async_throw(make_error(LIBUSB_ERROR_NOT_SUPPORTED));
+                    _firmware.assign(bytes.begin()+8,bytes.begin()+24);
+                    _optional_format=bytes.size()==26?be16(24):0;
+                    jinx_log_info()<<"profile300 reader HWID="<<std::hex<<_storage.hardware_id<<std::dec<<" firmware="<<_firmware;
                     libusb_fill_control_setup( _control_buffer, CTRL_DEVICE_TO_HOST, cmd_get_tls_key, 0, 0, 1000);
                     return *this 
                         / _control_transfer(_handle, _control_buffer, std::chrono::seconds(10)) 
                         / &WorkerControl::parse_tls_key;
                 }
                 case ev_arm_result:
-                    jinx_log_warning() << "tls event ev_arm_result" << std::endl;
+                    if(event._ev.unknown!=0)return async_throw(make_error(LIBUSB_ERROR_IO));
                     break;
                 case ev_dead_pixel_report:
                 {
-                    printf("dead pixel: \n");
-                    for (auto& buf : event._buffers) {
-                        auto iobuf = buf->slice_for_consumer();
-                        for (int i = 0 ; i < iobuf._size; ++i) {
-                            printf("%02hhx", reinterpret_cast<const char*>(iobuf.data())[i]);
-                        }
-                    }
-                    printf("\ndead pixel end\n");
-                    fflush(stdout);
-
-                    return stop_sensor();
+                    auto bytes=event_bytes(event);
+                    if(bytes.size()<4)return async_throw(make_error(LIBUSB_ERROR_IO));
+                    uint32_t count=uint32_t(bytes[0])|uint32_t(bytes[1])<<8|uint32_t(bytes[2])<<16|uint32_t(bytes[3])<<24;
+                    if(count>560 || bytes.size()!=4+2*count)return async_throw(make_error(LIBUSB_ERROR_IO));
+                    std::vector<uint16_t> defects;defects.reserve(count);
+                    for(size_t i=0;i<count;++i){uint16_t index=uint16_t(bytes[4+2*i])|uint16_t(bytes[5+2*i])<<8;
+                        if(index>=FPC_PIXELS)return async_throw(make_error(LIBUSB_ERROR_IO));defects.push_back(index);}
+                    _storage.dead_pixels=std::move(defects);
+                    return get_event();
                 }
                     break;
                 case ev_tls:
                     jinx_log_error() << "unexpected nested TLS event\n";
                     return async_throw(make_error(LIBUSB_ERROR_IO));
                 case ev_finger_down:
-                    if (_ready) {
-                        return *this / _put_image(&_image_queue, FPCEvent{FPCEvent::FPP_FingerDown, {}, {}}) / &WorkerControl::delay_get_image;
+                    if (_ready && _capture_active && _capture_generation==_storage.capture_generation) {
+                        return *this / _put_image(&_image_queue, FPCEvent{FPCEvent::FPP_FingerDown, {}, {}, {}, _capture_generation}) / &WorkerControl::delay_get_image;
                     }
                     break;
                 case ev_finger_up:
@@ -2208,27 +2220,11 @@ protected:
                     break;
                 case ev_image:
                 {
-                    // static int n = 0;
-                    // sleep(1);
-                    // std::ostringstream oss;
-                    // oss << n << ".data";
-                    // ++n;
-                    // std::ofstream out{oss.str(), std::ios::binary};
-                    // printf("image: \n");
-                    // for (auto& buf : event._buffers) {
-                    //     auto iobuf = buf->slice_for_consumer();
-                    //     out.write(reinterpret_cast<const char*>(iobuf.data()), iobuf.size()).abort_on(Failed_, "buffer overflow");
-                    //     for (int i = 0 ; i < iobuf._size; ++i) {
-                    //         printf("%02hhx", reinterpret_cast<const char*>(iobuf.data())[i]);
-                    //     }
-                    // }
-                    // printf("\nimage end\n");
-                    // fflush(stdout);
-                    // return stop_arm();
-                    // std::cout << "got image" << std::endl;
-                    return *this 
-                        / _put_image(&_image_queue, FPCEvent{FPCEvent::FPP_Image, {}, std::move(event._buffers)}) 
-                        / &WorkerControl::delay_get_image;
+                    if(!_capture_active || _capture_generation!=_storage.capture_generation)return get_event();
+                    _capture_active=false;
+                    return *this / _put_image(&_image_queue,
+                        FPCEvent{FPCEvent::FPP_Image,{},std::move(event._buffers),{},_capture_generation})
+                        / &WorkerControl::get_event;
                 }
                     break;
                 case ev_usb_logs:
@@ -2246,21 +2242,20 @@ protected:
             }
 
         } else if (event._type == FPCEvent::TLS_Ready) {
-            _ready = true;
-            _recovery_attempt = 0;
-            jinx_log_info() << "fingerprint sensor ready" << std::endl;
 
             // initialize storage
             std::filesystem::path storage_path{GET_OPTION(std::string, "data-path")};
             if (not std::filesystem::exists(storage_path)) {
                 std::filesystem::create_directory(storage_path);
             }
-            storage_path /= device_unique_id + ".bin";
+            storage_path /= device_unique_id + "-native.bin";
 
             _storage.init(storage_path.string(), _tls_key);
+            _ready=true;_storage.reader_ready=true;_recovery_attempt=0;
+            jinx_log_info()<<"fingerprint sensor ready"<<std::endl;
 
             _manager->start();
-            _device_task = task_new<WorkerDevice>(
+            if(!_device_task)_device_task = task_new<WorkerDevice>(
                 &_event_queue, 
                 &_image_queue, 
                 _manager, 
@@ -2270,89 +2265,41 @@ protected:
             // process pending message
             _manager->get_dbus().dispatch();
             
-            return stop_sensor();
+            libusb_fill_control_setup(_control_buffer,CTRL_HOST_TO_DEVICE,cmd_get_dead_pixel,0,0,0);
+            return *this / _control_transfer(_handle,_control_buffer,std::chrono::seconds(10)) / &WorkerControl::get_event;
 
         } else if (event._type == FPCEvent::FPP_StartSensor) {
+            if(!_ready || !_handle || _storage.sleeping)return get_event();
             return start_sensor();
 
         } else if (event._type == FPCEvent::FPP_StopSensor) {
+            _capture_active=false;
+            if(!_ready || !_handle)return get_event();
             return stop_sensor();
 
         } else if (event._type == FPCEvent::FPP_TransportFailed) {
             return notify_operation_failed(event._error);
+        } else if(event._type==FPCEvent::FPP_Suspend){
+            _suspended=true;_capture_active=false;
+            return notify_operation_failed(make_error(LIBUSB_ERROR_INTERRUPTED));
+        } else if(event._type==FPCEvent::FPP_Resume){
+            if(!_suspended)return get_event();
+            _suspended=false;_recovery_attempt=0;return reopen();
         }
         return get_event();
     }
 
     Async parse_tls_key() {
-        auto data_length = _control_transfer.get_result();
-        unsigned char* data = &_control_buffer[LIBUSB_CONTROL_SETUP_SIZE];
-        auto* hdr = reinterpret_cast<struct fpc_tls_key*>(data);
-        if (hdr->magic != 0x0dec0ded
-            || (hdr->aad_offset + hdr->aad_len) > data_length
-            || (hdr->key_offset + hdr->key_len) > data_length
-            || (hdr->sig_offset + hdr->sig_len) > data_length) 
-        {
-            jinx_log_error() << "invalid TLS key packet\n";
+        int data_length=_control_transfer.get_result();
+        unsigned char* data=&_control_buffer[LIBUSB_CONTROL_SETUP_SIZE];
+        if(data_length<static_cast<int>(sizeof(fpc_tls_key)))return async_throw(make_error(LIBUSB_ERROR_IO));
+        const auto* hdr=reinterpret_cast<const fpc_tls_key*>(data);
+        jinx_log_info()<<"wrapped TLS metadata bytes="<<data_length<<" key="<<hdr->key_offset<<":"<<hdr->key_len<<" aad="<<hdr->aad_offset<<":"<<hdr->aad_len<<" signature="<<hdr->sig_offset<<":"<<hdr->sig_len;
+        std::vector<unsigned char> tls_key;
+        if(!fpc::unwrap_tls_key(data,data_length,tls_key)) {
+            jinx_log_error()<<"wrapped TLS key validation failed"<<std::endl;
             return async_throw(make_error(LIBUSB_ERROR_IO));
         }
-
-        if (memcmp("FPC TLS Keys", hdr->data + hdr->aad_offset, 13) != 0) {
-            jinx_log_error() << "invalid TLS key AAD\n";
-            return async_throw(make_error(LIBUSB_ERROR_IO));
-        }
-
-        if (not crypto::verify_tls_key(
-            hdr->data + hdr->aad_offset, 
-            hdr->aad_len, 
-            hdr->data + hdr->key_offset, 
-            hdr->key_len, 
-            hdr->data + hdr->sig_offset, 
-            hdr->sig_len))
-        {
-            jinx_log_error() << "TLS key signature verification failed\n";
-            return async_throw(make_error(LIBUSB_ERROR_IO));
-        }
-
-        unsigned char sealing_key[SHA256_DIGEST_LENGTH];
-        crypto::sha256("FPC_SEALING_KEY", 16, sealing_key);
-
-        std::vector<unsigned char> tls_key{};
-        tls_key.reserve(64);
-
-        EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
-        EVP_CipherInit(ctx, EVP_aes_256_cbc(), sealing_key, nullptr, 0);
-        const size_t block_size = EVP_CIPHER_CTX_block_size(ctx);
-
-        int out_len = 0;
-        size_t decrypted = 0;
-        while(decrypted < hdr->key_len) {
-            out_len = 0;
-            unsigned char* output = tls_key.data() + decrypted;
-            tls_key.resize(tls_key.size() + block_size);
-
-            EVP_CipherUpdate(
-                ctx, 
-                output, 
-                &out_len, 
-                hdr->data + hdr->key_offset + decrypted, 
-                hdr->key_len - decrypted);
-            decrypted += out_len;
-            if (out_len < block_size) {
-                tls_key.resize(tls_key.size() - (block_size - out_len));
-            }
-        }
-
-        out_len = 0;
-        unsigned char* output = tls_key.data() + decrypted;
-        tls_key.resize(tls_key.size() + block_size);
-        EVP_CipherFinal(ctx, output, &out_len);
-        EVP_CIPHER_CTX_free(ctx);
-
-        if (out_len < block_size) {
-            tls_key.resize(tls_key.size() - (block_size - out_len));
-        }
-
         _tls_key = std::move(tls_key);
         _pipe->set_tls_key(_tls_key);
         
@@ -2363,11 +2310,14 @@ protected:
     }
 
     Async delay_get_image() {
-        return *this / _sleep(std::chrono::milliseconds(50)) / &WorkerControl::get_image;
+        if(!_capture_active || _capture_generation!=_storage.capture_generation)return get_event();
+        if(std::chrono::steady_clock::now()-_last_image>=std::chrono::milliseconds(200))return get_image();
+        return *this / _sleep(std::chrono::milliseconds(200)) / &WorkerControl::get_image;
     }
 
     Async get_image() {
-        // get image
+        if(!_capture_active || _capture_generation!=_storage.capture_generation)return get_event();
+        _last_image=std::chrono::steady_clock::now();
         libusb_fill_control_setup( _control_buffer, CTRL_HOST_TO_DEVICE, cmd_get_img, 0x0000, 0x0000, 0);
         
         return *this 
@@ -2376,48 +2326,31 @@ protected:
     }
 
     Async start_sensor() {
-        libusb_fill_control_setup( _control_buffer, CTRL_HOST_TO_DEVICE, cmd_arm, 0x0001, 0x0000, 4);
-        
-        unsigned char* data = &_control_buffer[LIBUSB_CONTROL_SETUP_SIZE];
-        data[0] = 0x11;
-        data[1] = 0x2f;
-        data[2] = 0x11;
-        data[3] = 0x17;
-        return *this 
-            / _control_transfer(_handle, _control_buffer, std::chrono::seconds(10)) 
-            / &WorkerControl::get_event;
+        _capture_active=true;_capture_generation=_storage.capture_generation;++_arm_token;
+        if(std::chrono::steady_clock::now()-_last_arm<std::chrono::milliseconds(100))
+            return *this / _sleep(std::chrono::milliseconds(100)) / &WorkerControl::submit_arm;
+        return submit_arm();
     }
-
+    Async submit_arm() {
+        if(!_capture_active || _capture_generation!=_storage.capture_generation)return get_event();
+        _last_arm=std::chrono::steady_clock::now();
+        libusb_fill_control_setup(_control_buffer,CTRL_HOST_TO_DEVICE,cmd_arm,2,0,4);
+        memcpy(&_control_buffer[LIBUSB_CONTROL_SETUP_SIZE],&_arm_token,4);
+        return *this / _control_transfer(_handle,_control_buffer,std::chrono::seconds(10)) / &WorkerControl::get_event;
+    }
     Async stop_sensor() {
-        libusb_fill_control_setup( _control_buffer, CTRL_HOST_TO_DEVICE, cmd_arm, 0x0001, 0x0000, 4);
-        unsigned char* data = &_control_buffer[LIBUSB_CONTROL_SETUP_SIZE];
-        data[0] = 0x12;
-        data[1] = 0x2f;
-        data[2] = 0x11;
-        data[3] = 0x17;
-        return *this 
-            / _control_transfer(_handle, _control_buffer, std::chrono::seconds(10)) 
-            / &WorkerControl::fpc_abort;
+        _capture_active=false;
+        libusb_fill_control_setup(_control_buffer,CTRL_HOST_TO_DEVICE,cmd_abort,1,0,0);
+        return *this / _control_transfer(_handle,_control_buffer,std::chrono::seconds(10)) / &WorkerControl::end_enrollment;
     }
-
-    Async fpc_abort() {
-        // get dead pixel
-        libusb_fill_control_setup( _control_buffer, CTRL_HOST_TO_DEVICE, cmd_abort, 0x0000, 0x0000, 0);
-        
-        return *this 
-            / _control_transfer(_handle, _control_buffer, std::chrono::seconds(10)) 
-            / &WorkerControl::end_session;
+    Async end_enrollment() {
+        libusb_fill_control_setup(_control_buffer,CTRL_HOST_TO_DEVICE,cmd_end_enrol,0,0,0);
+        return *this / _control_transfer(_handle,_control_buffer,std::chrono::seconds(10)) / &WorkerControl::end_session;
     }
-
     Async end_session() {
-        // get dead pixel
-        libusb_fill_control_setup( _control_buffer, CTRL_HOST_TO_DEVICE, cmd_fingerprint_sesson_off, 0x0000, 0x0000, 0);
-        
-        return *this 
-            / _control_transfer(_handle, _control_buffer, std::chrono::seconds(10)) 
-            / &WorkerControl::start_sensor;
+        libusb_fill_control_setup(_control_buffer,CTRL_HOST_TO_DEVICE,cmd_fingerprint_sesson_off,0,0,0);
+        return *this / _control_transfer(_handle,_control_buffer,std::chrono::seconds(10)) / &WorkerControl::get_event;
     }
-    
     Async get_kpi() {
         // get kpi
         libusb_fill_control_setup( _control_buffer, CTRL_DEVICE_TO_HOST, cmd_get_kpi, 0x0000, 0x0000, 28);

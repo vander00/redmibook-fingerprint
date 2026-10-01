@@ -30,6 +30,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #include <jinx/openssl/bio.hpp>
 
 #include <openssl/bio.h>
+#include <openssl/crypto.h>
 
 #define TLS_MAX_FRAGMENT_SIZE 4096
 
@@ -61,6 +62,7 @@ struct BIOPipe
     FPCAllocator _allocator{_memory};
 
     BIOPipe();
+    ~BIOPipe(){if(!_tls_key.empty())OPENSSL_cleanse(_tls_key.data(),_tls_key.size());}
 
     void set_tls_key(const std::vector<unsigned char>& tls_key) {
         _tls_key = tls_key;
@@ -72,7 +74,7 @@ struct BIOPipe
     {
         auto* self = reinterpret_cast<BIOPipe*>(SSL_get_app_data(ssl));
 
-        assert(max_psk_len >= self->_tls_key.size());
+        if(self->_tls_key.size()!=32 || max_psk_len<self->_tls_key.size())return 0;
         // TODO madvise(tls_key, MADV_DONTDUMP | MADV_DONTFORK)
         memcpy(psk, self->_tls_key.data(), self->_tls_key.size());
         return self->_tls_key.size();

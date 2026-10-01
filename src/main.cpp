@@ -40,15 +40,10 @@ using namespace fingerpp;
 typedef AsyncImplement<libevent::EventEngineLibevent> async;
 typedef posix::AsyncIOPosix<libevent::EventEngineLibevent> asyncio;
 
-const std::array<Argument, 7> arguments
+const std::array<Argument, 2> arguments
 {{
     { "bus", "session", 1, 256, "dbus bus. 'system' or 'session'. default 'session'" },
-    { "min-area", size_t(120000), size_t(1), size_t(0xFFFFFFFF), "min fingerprint area" },
-    { "min-score", float(0.5), float(0.1), float(1.0), "min score" },
-    { "position-min-score", float(0.4), float(0.1), float(1.0), "multi-template min score" },
-    { "data-path", "/var/lib/fprint", 1, 256, "data path" },
-    { "filter-before-ssim", false, "filter image before MSSIM" },
-    { "debug", false, "debug" }
+    { "data-path", "/var/lib/fprint", 1, 256, "data path" }
 }};
 
 #define OPT(t, n) config.check<RecordImmediate<t>>(n)->get_value()
@@ -110,6 +105,7 @@ int main(int argc, const char* argv[])
     AsyncUSB usb{eve};
 
     Manager manager{loop, dbus, usb, config};
+    manager.start();
 
     loop.run();
     return 0;

@@ -1,541 +1,369 @@
-/*
-Copyright (C) 2022  pom@vro.life
-
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU Affero General Public License as published
-by the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU Affero General Public License for more details.
-
-You should have received a copy of the GNU Affero General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-*/
-#include <filesystem>
-#include <fstream>
-#include <iostream>
-#include <algorithm>
-#include <cmath>
-#include <array>
-
-#include <sys/stat.h>
-#include <unistd.h>
-
-#include <openssl/aes.h>
-#include <openssl/evp.h>
-#include <openssl/rand.h>
-#include <opencv2/imgproc.hpp>
-
-#include "jinx/logging.hpp"
-
 #include "fingerprint.hpp"
 #include "crypto.hpp"
-
+#include <algorithm>
+#include <array>
+#include <cstring>
+#include <fcntl.h>
+#include <filesystem>
+#include <fstream>
+#include <jinx/logging.hpp>
+#include <memory>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <stdexcept>
+#include <set>
+#include <sys/stat.h>
+#include <unistd.h>
 namespace fpc {
-using namespace std::string_literals;
 namespace {
-constexpr std::array<unsigned char, 8> STORAGE_MAGIC{'F', 'P', 'C', 'D', 'B', 'v', '2', '!'};
-constexpr size_t STORAGE_NONCE_SIZE = 12;
+constexpr std::array<unsigned char, 8> magic = {'F', 'P', 'C', 'N', 'A', 'T', 'V', '1'};
+constexpr size_t maximum_file = 16 * 1024 * 1024;
+struct Template {
+    fpc_loaded_template data{};
+    ~Template() { fpc_loaded_template_destroy(&data); }
+};
+struct Capture {
+    fpc_loaded_capture data{};
+    ~Capture() { fpc_loaded_capture_destroy(&data); }
+};
+void append32(std::vector<unsigned char> &data, uint32_t value) {
+    for (unsigned i = 0; i < 4; ++i)
+        data.push_back(value >> (8 * i));
 }
-
-EnrollmentSampleResult Fingerprint::merge(const cv::Mat& img)
-{
-    if (_fingerprint.empty()) {
-        if (not cvext::has_enrollment_features(img)) {
-            return EnrollmentSampleResult::unmatchable;
-        }
-        _fingerprint = img.clone();
-        _mask.create(_fingerprint.size(), CV_32F);
-        _mask.setTo(1.0F);
-        _templates.push_back(img.clone());
-        _anchor_count = 1;
-        _learning_stats.emplace_back();
-        return EnrollmentSampleResult::accepted;
-    }
-
-    bool linked = false;
-    bool repeated_position = false;
-    for (const auto& saved : _templates) {
-        double overlap_ratio = 0.0;
-        if (cvext::enrollment_match(saved, img, overlap_ratio)) {
-            linked = true;
-            if (overlap_ratio > 1.0 - MIN_NEW_POSITION_AREA_RATIO) {
-                repeated_position = true;
-            }
-        }
-    }
-    if (not linked) {
-        return EnrollmentSampleResult::unmatchable;
-    }
-    if (_templates.size() < DISTINCT_AREA_POSITION_TEMPLATES and repeated_position) {
-        return EnrollmentSampleResult::insufficient_new_area;
-    }
-
-    if (_templates.size() < ENROLLMENT_POSITION_TEMPLATES) {
-        _templates.push_back(img.clone());
-        ++_anchor_count;
-        _learning_stats.emplace_back();
-    }
-    return EnrollmentSampleResult::accepted;
+void append_string(std::vector<unsigned char> &data, const std::string &value) {
+    if (value.empty() || value.size() > 256 || value.find('\0') != std::string::npos)
+        throw std::runtime_error("invalid native record name");
+    append32(data, value.size());
+    data.insert(data.end(), value.begin(), value.end());
 }
-
-bool Fingerprint::match(
-    const cv::Mat &img,
-    float legacy_min_score,
-    float position_min_score,
-    bool filter,
-    size_t* matched_template) const
-{
-    if (matched_template != nullptr) {
-        *matched_template = std::numeric_limits<size_t>::max();
+struct Reader {
+    const std::vector<unsigned char> &bytes;
+    size_t offset = 0;
+    uint32_t word() {
+        if (bytes.size() - offset < 4)
+            throw std::runtime_error("truncated native database");
+        uint32_t n = 0;
+        for (unsigned i = 0; i < 4; ++i)
+            n |= uint32_t(bytes[offset++]) << (8 * i);
+        return n;
     }
-    // Position-specific frames avoid forcing every verification press to align
-    // against a large stitched canvas. They use the same hardened
-    // SIFT/RANSAC/SSIM acceptance path and threshold as the legacy template;
-    // unlike PR #8, no uncalibrated classifier can accept a print by itself.
-    for (size_t idx = 0; idx < _templates.size(); ++idx) {
-        cv::Mat mask{_templates[idx].size(), CV_32F};
-        mask.setTo(1.0F);
-        if (cvext::match(_templates[idx], mask, img, 4, position_min_score, filter)) {
-            std::cout << "match: position-template=" << idx << std::endl;
-            if (matched_template != nullptr) {
-                *matched_template = idx;
-            }
-            return true;
-        }
+    std::vector<unsigned char> take(size_t count) {
+        if (count > bytes.size() - offset)
+            throw std::runtime_error("truncated native record");
+        std::vector<unsigned char> result(bytes.begin() + offset, bytes.begin() + offset + count);
+        offset += count;
+        return result;
     }
-
-    // Old databases contain only the stitched template. New databases keep a
-    // first-scan print/mask for storage compatibility, but do not use its lower legacy threshold:
-    // trying both paths would multiply false-accept opportunities and defeat
-    // the stricter per-position matcher.
-    if (_templates.empty()) {
-        return cvext::match(_fingerprint, _mask, img, 4, legacy_min_score, filter);
+    std::string string() {
+        auto count = word();
+        if (!count || count > 256)
+            throw std::runtime_error("invalid native name length");
+        auto value = take(count);
+        if (std::find(value.begin(), value.end(), 0) != value.end())
+            throw std::runtime_error("invalid native name");
+        return {value.begin(), value.end()};
     }
-    return false;
-}
-
-bool Fingerprint::strong_anchor_match(const cv::Mat& img) const
-{
-    for (size_t idx = 0; idx < std::min(_anchor_count, _templates.size()); ++idx) {
-        cvext::MatchEvidence evidence{};
-        if (cvext::strong_match(_templates[idx], img, 0.30, evidence)) {
-            return true;
-        }
+};
+void validate(const std::vector<unsigned char> &bytes) {
+    Template owned;
+    if (bytes.size() > 200000 ||
+        fpc_template_load_default(bytes.data(), bytes.size(), 32, &owned.data) ||
+        owned.data.graph.capacity != 32 || owned.data.collection.capacity != 32 ||
+        owned.data.collection.count > 32)
+        throw std::runtime_error("incompatible native template");
+    std::array<bool, 32> seen{};
+    for (size_t i = 0; i < 32; ++i) {
+        auto slot = owned.data.graph.order[i];
+        if (slot >= 32 || seen[slot])
+            throw std::runtime_error("invalid retained order");
+        seen[slot] = true;
     }
-    return false;
-}
-
-void Fingerprint::record_verification_use(size_t matched_template)
-{
-    if (_learning_stats.size() <= _anchor_count) {
-        return;
-    }
-    // Every successful verification is a chance for a learned position to
-    // contribute. A hit is credited only when no original anchor matched.
-    for (size_t idx = _anchor_count; idx < _learning_stats.size(); ++idx) {
-        auto& stats = _learning_stats[idx];
-        if (stats.opportunities < static_cast<uint32_t>(std::numeric_limits<int>::max())) {
-            ++stats.opportunities;
-        }
-    }
-    if (matched_template >= _anchor_count and
-        matched_template < _learning_stats.size()) {
-        auto& winner = _learning_stats[matched_template];
-        if (winner.hits < static_cast<uint32_t>(std::numeric_limits<int>::max())) {
-            ++winner.hits;
-        }
-    }
-    if (_unsaved_usage < std::numeric_limits<unsigned>::max()) {
-        ++_unsaved_usage;
+    if (owned.data.graph.protected_count > 32 || owned.data.graph.protected_limit > 32)
+        throw std::runtime_error("invalid retained protection");
+    for (size_t i = 0; i < owned.data.collection.count; ++i) {
+        auto &c = owned.data.collection.captures[i].view;
+        if (c.mode != 1 || c.descriptor_bytes != 16 || c.levels != 1 || c.count > 300)
+            throw std::runtime_error("incompatible profile300 capture");
     }
 }
-
-bool Fingerprint::observe_verified_scan(const cv::Mat& img, bool unique_anchor)
-{
-    if (not unique_anchor or not strong_anchor_match(img) or
-        _anchor_count == 0 or _anchor_count >= MAX_POSITION_TEMPLATES) {
-        return false;
-    }
-
-    // Keep only genuinely new positions. A strong match to an original scan
-    // is mandatory even when the candidate resembles a learned position.
-    for (const auto& saved : _templates) {
-        double overlap = 0.0;
-        if (cvext::enrollment_match(saved, img, overlap) and
-            overlap > 1.0 - MIN_NEW_POSITION_AREA_RATIO) {
-            return false;
-        }
-    }
-
-    size_t replace = std::numeric_limits<size_t>::max();
-    if (_templates.size() >= MAX_POSITION_TEMPLATES) {
-        // A learned position must have had ten chances to prove useful before
-        // it can be replaced. Smooth sparse hit rates so new slots survive.
-        for (size_t idx = _anchor_count; idx < _learning_stats.size(); ++idx) {
-            const auto& stats = _learning_stats[idx];
-            if (stats.opportunities < 10) {
-                continue;
-            }
-            if (replace == std::numeric_limits<size_t>::max()) {
-                replace = idx;
-                continue;
-            }
-            const auto& weakest = _learning_stats[replace];
-            const uint64_t candidate_rate = (uint64_t(stats.hits) + 1) * (uint64_t(weakest.opportunities) + 10);
-            const uint64_t weakest_rate = (uint64_t(weakest.hits) + 1) * (uint64_t(stats.opportunities) + 10);
-            if (candidate_rate < weakest_rate or
-                (candidate_rate == weakest_rate and stats.sequence < weakest.sequence)) {
-                replace = idx;
-            }
-        }
-        if (replace == std::numeric_limits<size_t>::max()) {
-            return false;
-        }
-    }
-
-    cvext::MatchEvidence pending_evidence{};
-    if (_pending_template.empty() or
-        not cvext::strong_match(_pending_template, img, 0.75, pending_evidence)) {
-        _pending_template = img.clone();
-        return false;
-    }
-
-    _pending_template.release();
-    LearningStats fresh{};
-    if (_learning_sequence < static_cast<uint32_t>(std::numeric_limits<int>::max())) {
-        ++_learning_sequence;
-    }
-    fresh.sequence = _learning_sequence;
-    if (replace == std::numeric_limits<size_t>::max()) {
-        _templates.push_back(img.clone());
-        _learning_stats.push_back(fresh);
-    } else {
-        _templates[replace] = img.clone();
-        _learning_stats[replace] = fresh;
-    }
-    return true;
+} // namespace
+std::vector<unsigned char> serialize_native_template(const fpc_loaded_template &data) {
+    std::vector<fpc_capture_payload_view> views;
+    for (size_t i = 0; i < data.collection.count; ++i)
+        views.push_back(data.collection.captures[i].view);
+    size_t size = 0;
+    if (fpc_template_serialize_default(&data.graph, views.data(), views.size(),
+                                       data.collection.capacity, data.metadata, 32, nullptr, 0,
+                                       &size))
+        throw std::runtime_error("native template size failed");
+    std::vector<unsigned char> bytes(size);
+    if (fpc_template_serialize_default(&data.graph, views.data(), views.size(),
+                                       data.collection.capacity, data.metadata, 32, bytes.data(),
+                                       bytes.size(), &size))
+        throw std::runtime_error("native template serialization failed");
+    return bytes;
 }
-
-size_t Fingerprint::total() const
-{
-    auto sum = cv::sum(_mask);
-    return static_cast<size_t>(sum[0]);
+FingerprintStorage::~FingerprintStorage() {
+    if (!_key.empty())
+        OPENSSL_cleanse(_key.data(), _key.size());
 }
-
-void Fingerprint::write(cv::FileStorage& fstorage, int idx) const
-{
-    std::string name{};
-    
-    name = "user"s + std::to_string(idx);
-    fstorage << name << _user;
-
-    name = "name"s + std::to_string(idx);
-    fstorage << name << _name;
-
-    name = "print"s + std::to_string(idx);
-    fstorage << name << _fingerprint;
-
-    name = "mask"s + std::to_string(idx);
-    fstorage << name << _mask;
-
-    name = "template_count"s + std::to_string(idx);
-    fstorage << name << static_cast<int>(_templates.size());
-    name = "anchor_count"s + std::to_string(idx);
-    fstorage << name << static_cast<int>(_anchor_count);
-    name = "learning_sequence"s + std::to_string(idx);
-    fstorage << name << static_cast<int>(_learning_sequence);
-
-    for (size_t template_idx = 0; template_idx < _templates.size(); ++template_idx) {
-        name = "template"s + std::to_string(idx) + "_"s + std::to_string(template_idx);
-        fstorage << name << _templates[template_idx];
-        if (template_idx >= _anchor_count and template_idx < _learning_stats.size()) {
-            const auto& stats = _learning_stats[template_idx];
-            const auto suffix = std::to_string(idx) + "_"s + std::to_string(template_idx);
-            fstorage << "learned_hits"s + suffix << static_cast<int>(stats.hits);
-            fstorage << "learned_opportunities"s + suffix << static_cast<int>(stats.opportunities);
-            fstorage << "learned_sequence"s + suffix << static_cast<int>(stats.sequence);
-        }
-    }
-}
-
-void Fingerprint::read(cv::FileStorage& fstorage, int idx)
-{
-    std::string name{};
-
-    name = "user"s + std::to_string(idx);
-    _user = fstorage[name].string();
-
-    name = "name"s + std::to_string(idx);
-    _name = fstorage[name].string();
-
-    name = "print"s + std::to_string(idx);
-    _fingerprint = fstorage[name].mat();
-
-    name = "mask"s + std::to_string(idx);
-    _mask = fstorage[name].mat();
-
-    _templates.clear();
-    name = "template_count"s + std::to_string(idx);
-    int template_count = fstorage[name].empty() ? 0 : static_cast<int>(fstorage[name]);
-    template_count = std::clamp(template_count, 0, static_cast<int>(MAX_POSITION_TEMPLATES));
-    for (int template_idx = 0; template_idx < template_count; ++template_idx) {
-        name = "template"s + std::to_string(idx) + "_"s + std::to_string(template_idx);
-        if (not fstorage[name].empty()) {
-            _templates.push_back(fstorage[name].mat());
-        }
-    }
-    name = "anchor_count"s + std::to_string(idx);
-    _anchor_count = fstorage[name].empty()
-        ? _templates.size() // Pre-adaptation records are all trusted originals.
-        : static_cast<size_t>(std::clamp(static_cast<int>(fstorage[name]), 0,
-                                          static_cast<int>(_templates.size())));
-    name = "learning_sequence"s + std::to_string(idx);
-    _learning_sequence = fstorage[name].empty() ? 0
-        : static_cast<uint32_t>(std::max(0, static_cast<int>(fstorage[name])));
-    _learning_stats.assign(_templates.size(), {});
-    for (size_t template_idx = _anchor_count; template_idx < _templates.size(); ++template_idx) {
-        const auto suffix = std::to_string(idx) + "_"s + std::to_string(template_idx);
-        auto& stats = _learning_stats[template_idx];
-        const auto hits = fstorage["learned_hits"s + suffix];
-        const auto opportunities = fstorage["learned_opportunities"s + suffix];
-        const auto sequence = fstorage["learned_sequence"s + suffix];
-        if (not hits.empty()) stats.hits = std::max(0, static_cast<int>(hits));
-        if (not opportunities.empty()) stats.opportunities = std::max(0, static_cast<int>(opportunities));
-        if (not sequence.empty()) stats.sequence = std::max(0, static_cast<int>(sequence));
-    }
-    _pending_template.release();
-    _unsaved_usage = 0;
-}
-    
-void FingerprintStorage::load()
-{
+void FingerprintStorage::reset() {
+    if (!_key.empty())
+        OPENSSL_cleanse(_key.data(), _key.size());
+    _filename.clear();
+    _key.clear();
     _fingerprints.clear();
-
-    std::filesystem::path filename{_filename};
-
-    if (not std::filesystem::exists(filename)) {
-        return;
-    }
-
-    size_t filesize = std::filesystem::file_size(filename);
-
-    if (filesize <= 16) {
-        return;
-    }
-
-    std::vector<unsigned char> encrypted{};
-    encrypted.resize(filesize);
-
-    FILE* file = fopen(_filename.c_str(), "rb");
-    if (file == nullptr) {
-        return;
-    }
-    // Check the read actually succeeded - a short read left the buffer partly
-    // uninitialised and was then handed to the AEAD decrypt.
-    bool read_ok = fread(encrypted.data(), encrypted.size(), 1, file) == 1;
-    fclose(file);
-    if (not read_ok) {
-        jinx_log_error() << "read " << _filename << " failed or truncated";
-        return;
-    }
-
-    const bool new_format = encrypted.size() >= STORAGE_MAGIC.size() + STORAGE_NONCE_SIZE + 16 and
-        std::equal(STORAGE_MAGIC.begin(), STORAGE_MAGIC.end(), encrypted.begin());
-    const size_t payload_offset = new_format ? STORAGE_MAGIC.size() + STORAGE_NONCE_SIZE : 0;
-    std::vector<unsigned char> data(encrypted.size() - payload_offset - 16);
-    jinx::SliceConst key{_key.data(), _key.size()};
-    jinx::SliceConst nonce{
-        new_format ? encrypted.data() + STORAGE_MAGIC.size() : _key.data(),
-        STORAGE_NONCE_SIZE};
-
-    auto ret = crypto::decrypt(
-        EVP_chacha20_poly1305(), 
-        key, 
-        nonce, 
-        key, 
-        {encrypted.data() + payload_offset, data.size()},
-        {data.data(), data.size()}, 
-        {encrypted.data() + encrypted.size() - 16, 16});
-
-    if (not ret) {
-        return;
-    }
-
-    std::string data_string{reinterpret_cast<char*>(data.data()), data.size()};
-    cv::FileStorage fstorage{data_string, cv::FileStorage::READ | cv::FileStorage::MEMORY | cv::FileStorage::FORMAT_JSON};
-
-    auto count = (int)fstorage["count"];
-
-    for (int idx = 0 ; idx < count; ++idx) {
-        Fingerprint print{};
-        print.read(fstorage, idx);
-        insert_or_update(std::move(print));
-    }
+    dead_pixels.clear();
 }
-
-bool FingerprintStorage::save()
-{
-    cv::FileStorage fstorage{"memory", cv::FileStorage::WRITE | cv::FileStorage::MEMORY | cv::FileStorage::FORMAT_JSON};
-    int count = 0;
-    std::string name{};
-    for (auto& user : _fingerprints) {
-        for (auto& print : user.second) {
-            print.second.write(fstorage, count);
-            ++ count;
+size_t FingerprintStorage::get_enrolled_count(const std::string &username) const {
+    auto user = _fingerprints.find(username);
+    return user == _fingerprints.end() ? 0 : user->second.size();
+}
+bool FingerprintStorage::check(const std::string &username, const std::string &name) const {
+    auto user = _fingerprints.find(username);
+    return user != _fingerprints.end() && user->second.count(name);
+}
+bool FingerprintStorage::delete_all(const std::string &user) {
+    auto before = _fingerprints;
+    _fingerprints.erase(user);
+    if (save())
+        return true;
+    _fingerprints = std::move(before);
+    return false;
+}
+bool FingerprintStorage::delete_fingerprint(const std::string &username, const std::string &name) {
+    if (!check(username, name))
+        return false;
+    auto before = _fingerprints;
+    _fingerprints[username].erase(name);
+    if (save())
+        return true;
+    _fingerprints = std::move(before);
+    return false;
+}
+bool FingerprintStorage::insert_or_update(Fingerprint &&fingerprint) {
+    if (!Fingerprint::valid_name(fingerprint._name))
+        throw std::runtime_error("invalid finger name");
+    validate(fingerprint._native);
+    auto before = _fingerprints;
+    auto user = fingerprint._user, name = fingerprint._name;
+    if (check(user, name))
+        fingerprint._registration = _fingerprints[user][name]._registration;
+    else {
+        uint32_t last = 0;
+        for (const auto &owner : _fingerprints)
+            for (const auto &record : owner.second)
+                last = std::max(last, record.second._registration);
+        if (last == UINT32_MAX)
+            return false;
+        fingerprint._registration = last + 1;
+    }
+    _fingerprints[user][name] = std::move(fingerprint);
+    if (save())
+        return true;
+    _fingerprints = std::move(before);
+    return false;
+}
+bool FingerprintStorage::verify(const std::string &user, const std::string &name,
+                                const fpc_prepared_capture &query) {
+    Capture probe;
+    if (fpc_capture_from_prepared(&query, 0, &probe.data))
+        throw std::runtime_error("native query allocation failed");
+    std::vector<Fingerprint *> records;
+    std::vector<std::unique_ptr<Template>> owned;
+    std::vector<const fpc_loaded_collection *> collections;
+    foreach (user, [&](Fingerprint &record) {
+        if (!Fingerprint::is_any(name) && name != record._name)
+            return false;
+        auto item = std::make_unique<Template>();
+        if (fpc_template_load_default(record._native.data(), record._native.size(), 32,
+                                      &item->data))
+            throw std::runtime_error("native stored template failed");
+        collections.push_back(&item->data.collection);
+        records.push_back(&record);
+        owned.push_back(std::move(item));
+        return false;
+    })
+        ;
+    fpc_identification_policy policy{18, 1000, 5, 20};
+    fpc_identification_result result{};
+    if (fpc_identify_profile300(collections.data(), collections.size(), &probe.data.view,
+                                query.confidence, const_cast<uint8_t *>(probe.data.view.membership),
+                                (probe.data.view.count + 7) / 8, &policy, &result))
+        throw std::runtime_error("native identification failed");
+    if (!result.matched)
+        return false;
+    auto index = static_cast<size_t>(result.selected_template);
+    auto &data = owned.at(index)->data;
+    fpc_collection_match_result match{};
+    if (fpc_match_profile300_collection(&data.collection, &probe.data.view,
+                                        const_cast<uint8_t *>(probe.data.view.membership),
+                                        (probe.data.view.count + 7) / 8, &match))
+        throw std::runtime_error("native update match failed");
+    fpc_template_update_policy update_policy{25, 8, 25, 60, 32};
+    fpc_template_update_state state{
+        102, 1, 1, 1, result.reported_score, static_cast<int8_t>(result.selected_capture), 0, -1};
+    uint8_t changed = 0;
+    if (fpc_update_template_after_match(&data, &probe.data, query.confidence, query.coverage,
+                                        query.quality, match.spatial_scores, match.count,
+                                        &update_policy, &state, &changed))
+        throw std::runtime_error("native template update failed");
+    if (state.changed) {
+        auto previous = records[index]->_native;
+        records[index]->_native = serialize_native_template(data);
+        if (!save()) {
+            records[index]->_native = std::move(previous);
+            jinx_log_error() << "native adaptation could not be saved";
         }
-    }
-    fstorage.write("count", count);
-
-    auto data = fstorage.releaseAndGetString();
-
-    std::vector<unsigned char> encrypted{};
-    const size_t payload_offset = STORAGE_MAGIC.size() + STORAGE_NONCE_SIZE;
-    encrypted.resize(payload_offset + data.size() + 16);
-    std::copy(STORAGE_MAGIC.begin(), STORAGE_MAGIC.end(), encrypted.begin());
-    if (RAND_bytes(encrypted.data() + STORAGE_MAGIC.size(), STORAGE_NONCE_SIZE) != 1) {
-        jinx_log_error() << "random fingerprint database nonce failed";
-        return false;
-    }
-
-    jinx::SliceConst key{_key.data(), _key.size()};
-    jinx::SliceConst nonce{encrypted.data() + STORAGE_MAGIC.size(), STORAGE_NONCE_SIZE};
-
-    if (not crypto::encrypt(
-        EVP_chacha20_poly1305(), 
-        key, 
-        nonce, 
-        key, 
-        {data.data(), 
-        data.size()}, 
-        {encrypted.data() + payload_offset, data.size()},
-        {encrypted.data() + payload_offset + data.size(), 16})) {
-        jinx_log_error() << "encrypt fingerprint database failed";
-        return false;
-    }
-
-    // Write atomically: serialise to a temporary file, fsync it, then rename
-    // over the real one. The original opened the live database with "wb", which
-    // truncates in place - a crash or power loss mid-write left a truncated
-    // file, i.e. every enrolled fingerprint for every user silently lost.
-    // rename(2) within the same directory is atomic, so the database is either
-    // the old version or the new one, never a partial write.
-    std::string tmp_filename = _filename + ".tmp";
-
-    FILE* file = fopen(tmp_filename.c_str(), "wb");
-    if (file == nullptr) {
-        // The original logged this and then called fwrite/fclose on the null
-        // pointer, crashing the daemon on any write failure (read-only mount,
-        // full disk, bad permissions).
-        jinx_log_error() << "write " << tmp_filename << " failed: " << strerror(errno);
-        return false;
-    }
-
-    bool ok = fwrite(encrypted.data(), encrypted.size(), 1, file) == 1;
-    if (not ok) {
-        jinx_log_error() << "write " << tmp_filename << " failed: " << strerror(errno);
-    }
-
-    // Force to disk before the rename, otherwise the rename can land while the
-    // contents are still only in the page cache.
-    if (ok and (fflush(file) != 0 or fsync(fileno(file)) != 0)) {
-        jinx_log_error() << "fsync " << tmp_filename << " failed: " << strerror(errno);
-        ok = false;
-    }
-
-    if (fclose(file) != 0 and ok) {
-        jinx_log_error() << "close " << tmp_filename << " failed: " << strerror(errno);
-        ok = false;
-    }
-
-    if (not ok) {
-        ::unlink(tmp_filename.c_str());
-        return false;
-    }
-
-    // Match the intended 0600 before the file becomes the live database, so
-    // there is no window where it is readable by others.
-    if (::chmod(tmp_filename.c_str(), S_IRUSR | S_IWUSR) != 0) {
-        jinx_log_error() << "chmod " << tmp_filename << " failed: " << strerror(errno);
-        ::unlink(tmp_filename.c_str());
-        return false;
-    }
-
-    if (::rename(tmp_filename.c_str(), _filename.c_str()) != 0) {
-        jinx_log_error() << "rename to " << _filename << " failed: " << strerror(errno);
-        ::unlink(tmp_filename.c_str());
-        return false;
     }
     return true;
 }
-
-void FingerprintStorage::init(const std::string &filename, const std::vector<unsigned char>& key)
-{
-    assert(key.size() == 32);
+void FingerprintStorage::init(const std::string &filename, const std::vector<unsigned char> &key) {
+    if (key.size() != 32)
+        throw std::runtime_error("invalid database encryption key");
     _filename = filename;
+    if (!_key.empty())
+        OPENSSL_cleanse(_key.data(), _key.size());
     _key = key;
     load();
 }
-
-void FingerprintStorage::insert_or_update(Fingerprint&& fingerprint)
-{
-    std::string name = fingerprint._name;
-    auto user = _fingerprints.find(fingerprint._user);
-    if (user == _fingerprints.end()) {
-        auto pair = _fingerprints.emplace(fingerprint._user, std::unordered_map<std::string, Fingerprint>{});
-        pair.first->second.emplace(name, std::move(fingerprint));
+void FingerprintStorage::load() {
+    if (!std::filesystem::exists(_filename)) {
+        _fingerprints.clear();
         return;
     }
-    auto print = user->second.find(name);
-    if (print == user->second.end()) {
-        user->second.emplace(name, std::move(fingerprint));
-    } else {
-        print->second = std::move(fingerprint);
+    auto size = std::filesystem::file_size(_filename);
+    if (size < 36 || size > maximum_file)
+        throw std::runtime_error("invalid native database size");
+    std::ifstream stream(_filename, std::ios::binary);
+    std::vector<unsigned char> encrypted(size);
+    if (!stream.read(reinterpret_cast<char *>(encrypted.data()), size) ||
+        !std::equal(magic.begin(), magic.end(), encrypted.begin()))
+        throw std::runtime_error("invalid native database header");
+    std::vector<unsigned char> plain(size - 36);
+    jinx::SliceConst key{_key.data(), _key.size()};
+    if (!crypto::decrypt(EVP_chacha20_poly1305(), {encrypted.data(), 8}, {encrypted.data() + 8, 12},
+                         key, {encrypted.data() + 20, plain.size()}, {plain.data(), plain.size()},
+                         {encrypted.data() + size - 16, 16}))
+        throw std::runtime_error("native database authentication failed");
+    Reader reader{plain};
+    if (reader.word() != 1 || reader.word() != 300 || reader.word() != 112 || reader.word() != 88 ||
+        reader.word() != 26 || reader.word() != hardware_id)
+        throw std::runtime_error("native database profile mismatch");
+    auto count = reader.word();
+    if (count > 1000)
+        throw std::runtime_error("too many native records");
+    Records parsed;
+    std::set<uint32_t> registrations;
+    for (uint32_t i = 0; i < count; ++i) {
+        Fingerprint print;
+        print._registration = reader.word();
+        if (!print._registration || !registrations.insert(print._registration).second)
+            throw std::runtime_error("invalid native registration");
+        print._user = reader.string();
+        print._name = reader.string();
+        if (!Fingerprint::valid_name(print._name))
+            throw std::runtime_error("invalid stored finger name");
+        auto length = reader.word();
+        if (length > 200000)
+            throw std::runtime_error("native template too large");
+        print._native = reader.take(length);
+        validate(print._native);
+        auto user = print._user, name = print._name;
+        if (parsed[user].count(name))
+            throw std::runtime_error("duplicate native record");
+        parsed[user].emplace(name, std::move(print));
     }
+    if (reader.offset != plain.size())
+        throw std::runtime_error("trailing native database data");
+    _fingerprints = std::move(parsed);
 }
-
-Fingerprint* FingerprintStorage::unique_strong_anchor(
-    const std::string& username, const cv::Mat& img)
-{
-    Fingerprint* found = nullptr;
-    bool ambiguous = false;
-    foreach(username, [&](Fingerprint& print) {
-        if (print.strong_anchor_match(img)) {
-            if (found != nullptr) {
-                ambiguous = true;
-                return true;
-            }
-            found = &print;
-        }
-        return false;
-    });
-    return ambiguous ? nullptr : found;
-}
-
-bool FingerprintStorage::update_after_verification(
-    Fingerprint& fingerprint, const cv::Mat& img, bool unique_anchor)
-{
-    Fingerprint before = fingerprint;
+bool FingerprintStorage::save() {
     try {
-        if (fingerprint.observe_verified_scan(img, unique_anchor)) {
-            if (not save()) {
-                fingerprint = std::move(before);
-                return false;
+        if (_key.size() != 32 || _filename.empty())
+            return false;
+        std::vector<unsigned char> plain;
+        for (uint32_t value : {1u, 300u, 112u, 88u, 26u, uint32_t(hardware_id)})
+            append32(plain, value);
+        uint32_t count = 0;
+        for (auto &user : _fingerprints)
+            count += user.second.size();
+        if (count > 1000)
+            return false;
+        append32(plain, count);
+        for (auto &user : _fingerprints)
+            for (auto &entry : user.second) {
+                auto &print = entry.second;
+                append32(plain, print._registration);
+                append_string(plain, print._user);
+                append_string(plain, print._name);
+                append32(plain, print._native.size());
+                plain.insert(plain.end(), print._native.begin(), print._native.end());
             }
-            fingerprint.usage_saved();
-            return true;
+        if (plain.size() > maximum_file - 36)
+            return false;
+        std::vector<unsigned char> encrypted(plain.size() + 36);
+        std::copy(magic.begin(), magic.end(), encrypted.begin());
+        if (RAND_bytes(encrypted.data() + 8, 12) != 1)
+            return false;
+        jinx::SliceConst key{_key.data(), _key.size()};
+        if (!crypto::encrypt(EVP_chacha20_poly1305(), {encrypted.data(), 8},
+                             {encrypted.data() + 8, 12}, key, {plain.data(), plain.size()},
+                             {encrypted.data() + 20, plain.size()},
+                             {encrypted.data() + 20 + plain.size(), 16}))
+            return false;
+        auto directory = std::filesystem::path(_filename).parent_path();
+        if (directory.empty())
+            directory = ".";
+        int parent = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (parent < 0)
+            return false;
+        std::string pattern = _filename + ".tmp.XXXXXX";
+        std::vector<char> temporary_name(pattern.begin(), pattern.end());
+        temporary_name.push_back(0);
+        int descriptor = mkostemp(temporary_name.data(), O_CLOEXEC);
+        std::string temporary = temporary_name.data();
+        if (descriptor < 0) {
+            close(parent);
+            return false;
         }
-        if (fingerprint.usage_save_due() and save()) {
-            fingerprint.usage_saved();
+        if (fchmod(descriptor, 0600) != 0) {
+            close(descriptor);
+            close(parent);
+            unlink(temporary.c_str());
+            return false;
         }
-    } catch (const std::exception& exc) {
-        fingerprint = std::move(before);
-        jinx_log_error() << "adaptive fingerprint update failed: " << exc.what();
+        size_t offset = 0;
+        bool ok = true;
+        while (offset < encrypted.size()) {
+            auto written = write(descriptor, encrypted.data() + offset, encrypted.size() - offset);
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0) {
+                ok = false;
+                break;
+            }
+            offset += written;
+        }
+        if (ok)
+            ok = fsync(descriptor) == 0;
+        if (close(descriptor) != 0)
+            ok = false;
+        if (ok)
+            ok = rename(temporary.c_str(), _filename.c_str()) == 0;
+        if (!ok) {
+            unlink(temporary.c_str());
+            close(parent);
+            return false;
+        }
+        if (fsync(parent) != 0)
+            jinx_log_error() << "native database directory fsync failed: " << strerror(errno);
+        close(parent);
+        // The rename already committed; reporting failure here would roll back only memory.
+        return true;
+    } catch (const std::exception &error) {
+        jinx_log_error() << "native database save failed: " << error.what();
+        return false;
     }
-    return false;
 }
-
-}
+} // namespace fpc

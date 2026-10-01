@@ -5,9 +5,9 @@ endif(APPLE)
 
 find_package(OpenSSL REQUIRED)
 
-add_library(fpc9201 STATIC crypto.cpp fpc9201.cpp fpcbio.cpp fingerprint.cpp)
-target_link_libraries(fpc9201 PUBLIC jinx manager cvext OpenSSL::SSL OpenSSL::Crypto jinx::usb jinx::dbus jinx::openssl)
+add_library(fpcnative STATIC native/fpc_recovered.c native/profile300.c native/enrollment.c)
+target_compile_options(fpcnative PRIVATE -ffp-contract=off -fno-fast-math)
+target_link_libraries(fpcnative PUBLIC m)
 
-if (CMAKE_BUILD_TYPE STREQUAL Debug)
-target_compile_definitions(fpc9201 PRIVATE -DUSE_HIGHGUI=1)
-endif()
+add_library(fpc9201 STATIC crypto.cpp fpc9201.cpp fpcbio.cpp fingerprint.cpp)
+target_link_libraries(fpc9201 PUBLIC fpcnative jinx manager OpenSSL::SSL OpenSSL::Crypto jinx::usb jinx::dbus jinx::openssl)
