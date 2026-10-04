@@ -31,9 +31,6 @@ cd redmibook-fingerprint
 ## fedora copr package
 
 ```bash
-<<<<<<< HEAD
-sudo dnf copr enable OWNER/PROJECT
-=======
 sudo dnf copr enable raymondila/redmibook-fingerprint
 >>>>>>> c3572f6 (fedora copr)
 sudo dnf install fingerprint-ocv
