@@ -23,11 +23,7 @@ jobs:
         include:
           - arch: x86_64
             runner: ubuntu-24.04
-            asset: fingerprint-ocv-linux-x86_64
-
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-            asset: fingerprint-ocv-linux-aarch64
+            asset: fingerprint-ocv
 
     runs-on: ${{ matrix.runner }}
 
