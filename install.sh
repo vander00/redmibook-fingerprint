@@ -7,7 +7,9 @@ readonly BUILD_DIR="${BUILD_DIR:-${SCRIPT_DIR}/build/install}"
 readonly INSTALL_PREFIX="/usr/local"
 readonly SERVICE_NAME="fprintd.service"
 readonly SERVICE_DROP_IN="fprintd-fingerprint-ocv.conf"
-readonly RELEASE_BASE_URL="https://github.com/vander00/redmibook-fingerprint/releases/latest/download"
+readonly RELEASE_BASE_URL="https://github.com/vander00/redmibook-fingerprint/releases/download"
+readonly RELEASE_VERSION="${RELEASE_VERSION:-}"
+readonly RELEASE_SHA256="${RELEASE_SHA256:-}"
 DOWNLOAD_DIR=""
 RELEASE_BINARY=""
 
@@ -39,6 +41,11 @@ download_release_binary() {
     local architecture asset url output
     local -a assets
 
+    if [[ -z "${RELEASE_VERSION}" || ! "${RELEASE_SHA256}" =~ ^[[:xdigit:]]{64}$ ]]; then
+        log "Skipping release download; set RELEASE_VERSION and its 64-character RELEASE_SHA256 to enable verified installation"
+        return 1
+    fi
+
     case "$(uname -m)" in
         x86_64|amd64) architecture="x86_64" ;;
         aarch64|arm64) architecture="aarch64" ;;
@@ -65,7 +72,7 @@ download_release_binary() {
     fi
 
     for asset in "${assets[@]}"; do
-        url="${RELEASE_BASE_URL}/${asset}"
+        url="${RELEASE_BASE_URL}/${RELEASE_VERSION}/${asset}"
         log "Trying release asset ${asset}"
 
         if command -v curl >/dev/null 2>&1; then
@@ -76,8 +83,13 @@ download_release_binary() {
         fi
 
         if [[ -s "${output}" ]]; then
+            if ! printf '%s  %s\n' "${RELEASE_SHA256}" "${output}" | sha256sum --check --status -; then
+                rm -f -- "${output}"
+                log "Checksum verification failed for ${asset}"
+                return 1
+            fi
             RELEASE_BINARY="${output}"
-            log "Downloaded ${asset} from the latest GitHub release"
+            log "Downloaded and verified ${asset} from release ${RELEASE_VERSION}"
             return 0
         fi
     done

@@ -19,14 +19,21 @@ Other devices are not supported by this driver.
 ## Install
 
 The installer only works for systemd systems.
-It downloads the latest binary from the releases.
+For a verified binary install, provide an explicit release version and the
+SHA-256 digest published for that asset; otherwise it builds from source.
 It can also build from source for Arch, Debian/Ubuntu, Fedora linux systems.
 
 ```bash
 git clone https://github.com/vander00/redmibook-fingerprint.git
 cd redmibook-fingerprint
+RELEASE_VERSION=v1.2.3 \
+RELEASE_SHA256=<asset-sha256> \
 ./install.sh
 ```
+
+The release workflow publishes the digest beside the binary as
+`fingerprint-ocv.sha256`. The installer refuses mutable `latest` downloads and
+rejects an asset whose digest does not match.
 
 ## fedora copr package
 
