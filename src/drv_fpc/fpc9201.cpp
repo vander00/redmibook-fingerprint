@@ -1879,6 +1879,7 @@ class WorkerControl : public AsyncRoutine
     std::vector<TaskPtr> _tasks{};
     bool _ready{};
     bool _capture_active{};
+    bool _awaiting_first_touch{},_stale_capture{};
     uint64_t _capture_generation{};
     uint32_t _arm_token=0x17112f10;
     uint16_t _reader_identity{},_optional_format{};
@@ -2212,6 +2213,12 @@ protected:
                     return async_throw(make_error(LIBUSB_ERROR_IO));
                 case ev_finger_down:
                     if (_ready && _capture_active && _capture_generation==_storage.capture_generation) {
+                        auto since_arm=std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now()-_last_arm).count();
+                        _stale_capture=_awaiting_first_touch && since_arm<1000;
+                        _awaiting_first_touch=false;
+                        jinx_log_info()<<"finger down "<<since_arm<<"ms after arm"<<(_stale_capture?" (latched at power-on)":"")<<std::endl;
+                        if(_stale_capture)return delay_get_image();
                         return *this / _put_image(&_image_queue, FPCEvent{FPCEvent::FPP_FingerDown, {}, {}, {}, _capture_generation}) / &WorkerControl::delay_get_image;
                     }
                     break;
@@ -2221,6 +2228,11 @@ protected:
                 case ev_image:
                 {
                     if(!_capture_active || _capture_generation!=_storage.capture_generation)return get_event();
+                    if(_stale_capture){
+                        _stale_capture=false;
+                        jinx_log_info()<<"discarded capture latched at power-on; waiting for a fresh touch"<<std::endl;
+                        return start_sensor();
+                    }
                     _capture_active=false;
                     return *this / _put_image(&_image_queue,
                         FPCEvent{FPCEvent::FPP_Image,{},std::move(event._buffers),{},_capture_generation})
@@ -2252,6 +2264,7 @@ protected:
 
             _storage.init(storage_path.string(), _tls_key);
             _ready=true;_storage.reader_ready=true;_recovery_attempt=0;
+            _awaiting_first_touch=true;_stale_capture=false;
             jinx_log_info()<<"fingerprint sensor ready"<<std::endl;
 
             _manager->start();
