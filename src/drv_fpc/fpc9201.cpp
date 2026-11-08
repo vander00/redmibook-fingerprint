@@ -476,6 +476,11 @@ public:
         if((!interface.empty() && !dbus_message_has_interface(msg,interface.c_str())) ||
            (!member.empty() && !dbus_message_has_member(msg,member.c_str())) ||
            (!path.empty() && !dbus_message_has_path(msg,path.c_str())))return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+        // Match rules are evaluated by the bus, but lifecycle state changes
+        // also require an application-level sender check.  A delivered signal
+        // must carry the authenticated sender named by the rule.
+        if(!sender.empty() && !dbus_message_has_sender(msg,sender.c_str()))
+            return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
         if(!arg0.empty()){DBusMessageIter args{};const char* value=nullptr;
             if(!dbus_message_iter_init(msg,&args) || dbus_message_iter_get_arg_type(&args)!=DBUS_TYPE_STRING)return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
             dbus_message_iter_get_basic(&args,&value);if(!value || arg0!=value)return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;}
@@ -979,6 +984,21 @@ protected:
             return *this / _send_message(_connection, reply) / &WorkerDevice::run;
         }
 
+        // Validate ownership before starting an interactive authorization.
+        // This prevents an unclaimed or foreign caller from consuming a gate.
+        if (not _claimed) {
+            AsyncDBusMessage reply{
+                dbus_message_new_error(msg, "net.reactivated.Fprint.Error.ClaimDevice", "not claimed")
+            };
+            return *this / _send_message(_connection, reply) / &WorkerDevice::run;
+        }
+        if (_claimed_sender != sender) {
+            AsyncDBusMessage reply{
+                dbus_message_new_error(msg, "net.reactivated.Fprint.Error.AlreadyInUse", "device already in use")
+            };
+            return *this / _send_message(_connection, reply) / &WorkerDevice::run;
+        }
+
         const std::string key = std::string(sender) + ":" + std::to_string(dbus_message_get_serial(msg));
         auto gate = _auth_gates.find(key);
         if (gate != _auth_gates.end()) {
@@ -996,13 +1016,17 @@ protected:
             return check_sender();
         }
 
-        // Reject early if the device is claimed by someone else - the
-        // re-queued call will fail check_sender() anyway, and skipping the
-        // prompt avoids a dialog that can never succeed (upstream checks
-        // claim state before asking polkit too).
-        if (_claimed and _claimed_sender != sender) {
+        // Reject duplicate requests from one sender before retaining their
+        // messages.  This also prevents prompt spam with fresh serials.
+        const auto sender_gate = std::find_if(
+            _auth_gates.begin(), _auth_gates.end(),
+            [sender](const auto& entry) {
+                return entry.second.sender == sender
+                    and entry.second.state != AuthGate::State::finished;
+            });
+        if (sender_gate != _auth_gates.end()) {
             AsyncDBusMessage reply{
-                dbus_message_new_error(msg, "net.reactivated.Fprint.Error.AlreadyInUse", "device already in use")
+                dbus_message_new_error(msg, "net.reactivated.Fprint.Error.Busy", "authorization already pending")
             };
             return *this / _send_message(_connection, reply) / &WorkerDevice::run;
         }
@@ -1014,6 +1038,13 @@ protected:
             } else {
                 ++it;
             }
+        }
+
+        if (_auth_gates.size() >= max_auth_gates) {
+            AsyncDBusMessage reply{
+                dbus_message_new_error(msg, "net.reactivated.Fprint.Error.Busy", "too many authorizations pending")
+            };
+            return *this / _send_message(_connection, reply) / &WorkerDevice::run;
         }
 
         AsyncDBusMessage parked{dbus_message_ref(msg)};
