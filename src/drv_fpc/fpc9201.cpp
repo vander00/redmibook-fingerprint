@@ -740,6 +740,11 @@ class WorkerDevice : public AsyncDBusObject {
     };
     std::unordered_map<std::string, AuthGate> _auth_gates{};
 
+    // PolicyKit prompts retain the original D-Bus message until they resolve.
+    // Keep fan-out bounded even when a caller uses a fresh serial for every
+    // request.  A sender may have only one interactive check in flight.
+    static constexpr size_t max_auth_gates = 8;
+
 public:
     WorkerDevice() = default;
 
@@ -809,6 +814,12 @@ protected:
 
     void async_finalize() noexcept override {
         _manager->unregister_device(_dbus_path);
+        for (auto& gate : _auth_gates) {
+            if (gate.second.task != nullptr) {
+                async_cancel(gate.second.task) >> JINX_IGNORE_RESULT;
+            }
+        }
+        _auth_gates.clear();
         if (_enroll_verify_task != nullptr) {
             async_cancel(_enroll_verify_task) >> JINX_IGNORE_RESULT;
             _enroll_verify_task.reset();
@@ -1239,6 +1250,17 @@ protected:
         _claimed = false;
         _claimed_sender.clear();
         _claimed_user.clear();
+
+        // Cancellation alone can leave an image waiter and sensor capture
+        // active. Keep explicit Release equivalent to disconnect cleanup.
+        _image_queue->reset();
+        return *this
+            / _put_event(_event_queue, FPCEvent{FPCEvent::FPP_StopSensor, {}, {}})
+            / &WorkerDevice::release_reply;
+    }
+
+    Async release_reply() {
+        auto& msg = get_message();
 
         AsyncDBusMessage reply{
             dbus_message_new_method_return(msg)
@@ -1736,6 +1758,12 @@ protected:
         try{auto frame=_framer.next();if(!frame)return prepare();
             auto event=frame_event(std::move(*frame),_pipe);
             if(event._ev.code==ev_tls){_buffers=std::move(event._buffers);_buffer_index=0;return handle_tls_data();}
+            // Image payloads are valid only inside the authenticated TLS
+            // stream. Finger transition events are emitted by this sensor on
+            // the outer control channel, so preserve those while rejecting
+            // the raw biometric payload itself.
+            if(event._ev.code==ev_image)
+                return async_throw(make_error(LIBUSB_ERROR_ACCESS));
             return *this / _put_event(_event_queue,std::move(event)) / &USBInput::dispatch_frames;
         }catch(const std::exception&){return async_throw(make_error(LIBUSB_ERROR_IO));}
     }
