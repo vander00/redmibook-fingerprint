@@ -7,7 +7,12 @@ readonly BUILD_DIR="${BUILD_DIR:-${SCRIPT_DIR}/build/install}"
 readonly INSTALL_PREFIX="/usr/local"
 readonly SERVICE_NAME="fprintd.service"
 readonly SERVICE_DROP_IN="fprintd-fingerprint-ocv.conf"
-readonly RELEASE_BASE_URL="https://github.com/vander00/redmibook-fingerprint/releases/latest/download"
+readonly RELEASE_REPO_URL="https://github.com/vander00/redmibook-fingerprint/releases"
+# Optional: pin a release tag (e.g. v2.1). Defaults to the latest release.
+readonly RELEASE_VERSION="${RELEASE_VERSION:-}"
+# Optional: expected SHA-256 of the binary. Defaults to the digest published
+# beside the asset as <asset>.sha256 in the same release.
+readonly RELEASE_SHA256="${RELEASE_SHA256:-}"
 DOWNLOAD_DIR=""
 RELEASE_BINARY=""
 
@@ -35,9 +40,32 @@ cleanup() {
     fi
 }
 
+fetch() {
+    local url="$1" output="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 \
+            --output "${output}" "${url}"
+    else
+        wget --quiet --https-only --output-document="${output}" "${url}"
+    fi
+}
+
 download_release_binary() {
-    local architecture asset url output
+    local architecture asset url output base_url release_label expected checksum_file
     local -a assets
+
+    if [[ -n "${RELEASE_SHA256}" && ! "${RELEASE_SHA256}" =~ ^[[:xdigit:]]{64}$ ]]; then
+        die "RELEASE_SHA256 must be a 64-character hexadecimal SHA-256 digest"
+    fi
+
+    if [[ -n "${RELEASE_VERSION}" ]]; then
+        base_url="${RELEASE_REPO_URL}/download/${RELEASE_VERSION}"
+        release_label="release ${RELEASE_VERSION}"
+    else
+        base_url="${RELEASE_REPO_URL}/latest/download"
+        release_label="the latest GitHub release"
+    fi
 
     case "$(uname -m)" in
         x86_64|amd64) architecture="x86_64" ;;
@@ -53,11 +81,17 @@ download_release_binary() {
         return 1
     fi
 
+    if ! command -v sha256sum >/dev/null 2>&1; then
+        log "sha256sum is not available to verify the release binary; building from source"
+        return 1
+    fi
+
     DOWNLOAD_DIR="$(mktemp -d)" || {
         log "Could not create a temporary download directory"
         return 1
     }
     output="${DOWNLOAD_DIR}/fingerprint-ocv"
+    checksum_file="${DOWNLOAD_DIR}/fingerprint-ocv.sha256"
     assets=("fingerprint-ocv-linux-${architecture}")
     # Keep compatibility with the original unqualified x86-64 asset name.
     if [[ "${architecture}" == x86_64 ]]; then
@@ -65,21 +99,37 @@ download_release_binary() {
     fi
 
     for asset in "${assets[@]}"; do
-        url="${RELEASE_BASE_URL}/${asset}"
-        log "Trying release asset ${asset}"
+        url="${base_url}/${asset}"
+        log "Trying release asset ${asset} from ${release_label}"
 
-        if command -v curl >/dev/null 2>&1; then
-            curl --fail --location --silent --show-error \
-                --output "${output}" "${url}" || continue
+        fetch "${url}" "${output}" 2>/dev/null || continue
+        [[ -s "${output}" ]] || continue
+
+        if [[ -n "${RELEASE_SHA256}" ]]; then
+            expected="${RELEASE_SHA256}"
         else
-            wget --quiet --output-document="${output}" "${url}" || continue
+            if ! fetch "${url}.sha256" "${checksum_file}" 2>/dev/null; then
+                rm -f -- "${output}"
+                log "No published checksum (${asset}.sha256) in ${release_label}; refusing the unverified binary and building from source"
+                return 1
+            fi
+            # The checksum file uses sha256sum format: "<digest>  <name>".
+            read -r expected _ < "${checksum_file}" || true
+            if [[ ! "${expected}" =~ ^[[:xdigit:]]{64}$ ]]; then
+                rm -f -- "${output}"
+                log "Malformed checksum file for ${asset}; refusing the unverified binary and building from source"
+                return 1
+            fi
         fi
 
-        if [[ -s "${output}" ]]; then
-            RELEASE_BINARY="${output}"
-            log "Downloaded ${asset} from the latest GitHub release"
-            return 0
+        if ! printf '%s  %s\n' "${expected,,}" "${output}" | sha256sum --check --status -; then
+            rm -f -- "${output}"
+            die "SHA-256 verification failed for ${asset} from ${release_label}; the download may be corrupted or tampered with"
         fi
+
+        RELEASE_BINARY="${output}"
+        log "Downloaded ${asset} from ${release_label} and verified SHA-256 ${expected,,}"
+        return 0
     done
 
     log "No compatible release binary was found; building from source"
@@ -144,7 +194,7 @@ if [[ -n "${RELEASE_BINARY}" ]]; then
     install_dependencies false
     run_as_root install -Dm755 "${RELEASE_BINARY}" \
         "${INSTALL_PREFIX}/bin/fingerprint-ocv"
-    log "Installed the driver from the latest GitHub release"
+    log "Installed the verified release binary"
 else
     install_dependencies true
     [[ -f "${SCRIPT_DIR}/CMakeLists.txt" ]] || die "run this script from a complete source checkout"
